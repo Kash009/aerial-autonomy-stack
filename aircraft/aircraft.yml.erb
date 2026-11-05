@@ -201,4 +201,8 @@ windows:
       layout: even-horizontal
       panes:
         - python3 /aas/aircraft_resources/scripts/gymnasium_setup.py --drone_id <%= drone_id %> <%= simulated_time ? '--ros-args -p use_sim_time:=true' : '' %>
+        <% if autopilot == 'ardupilot' && drone_type == 'quad' %>
+        # RL action relay: receives Gym velocity commands on UDP 5870 + drone_id and flies them via MAVROS GUIDED mode
+        - until python3 /aas/aircraft_resources/scripts/rl_guided_relay.py --drone-id <%= drone_id %> <%= simulated_time ? '--ros-args -p use_sim_time:=true' : '' %>; do sleep 2; done
+        <% end %>
   <% end %>

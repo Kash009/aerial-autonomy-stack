@@ -15,6 +15,17 @@ from docker.types import DeviceRequest
 class AASEnv(gym.Env):
     metadata = {"render_modes": ["human", "ansi"]}
 
+    # Reward/termination tuning (see _update_from_payload)
+    GOAL_RADIUS_M = 3.0       # Horizontal radius to consider the goal reached
+    GOAL_ALT_TOL_M = 4.0      # Vertical tolerance on top of it
+    CRASH_AGL_M = 1.0         # World altitude below which the episode ends (ground contact)
+    SUCCESS_REWARD = 100.0
+    CRASH_REWARD = -100.0     # Applied when hitting the ground fast, see _update_from_payload
+    SOFT_LAND_REWARD = -30.0  # Applied when ending on the ground slowly
+    OUT_OF_BOUNDS_REWARD = -50.0
+    ALIVE_PENALTY_PER_SEC = -2.5
+    PROGRESS_GAIN = 1.0       # Potential shaping gain (meters of progress toward goal)
+
     def __init__(self,
             instance: int=0,
             gym_freq_hz: int=50,
@@ -24,29 +35,54 @@ class AASEnv(gym.Env):
             odom: str="none",
             num_quads: int=1,
             render_mode=None,
-            gpu: bool=True
+            gpu: bool=True,
+            max_speed: float=7.0,      # [m/s] commanded by an action of 1.0 (planar and vertical)
+            max_yaw_rate: float=1.0,   # [rad/s]
+            goal_range=(15.0, 45.0),   # [m] min/max distance of the sampled goal from the spawn point
+            bounds_radius_m: float=250.0  # Horizontal distance from spawn beyond which the episode ends
         ):
         super().__init__()
 
         self.GYM_FREQ_HZ = gym_freq_hz
         self.GYM_INIT_DURATION = 80.0  # Seconds to run unpaused during reset (seconds)
         self.MAX_EPISODE_LENGTH_SEC = 300.0  # Max episode length in seconds (excluding init duration)
-        
-        # [DUMMY] Action Space: [/action] between -1.0 and 1.0
+
+        self.NUM_DRONES = int(num_quads)  # Keep in sync with the (currently zero) NUM_VTOLS/NUM_TAILS below
+        self.max_speed = float(max_speed)
+        self.max_yaw_rate = float(max_yaw_rate)
+        self.goal_range = goal_range
+        self.bounds_radius_m = float(bounds_radius_m)
+
+        # Action Space: normalized [vE, vN, vUp (m/s), yaw rate (rad/s)] command for the first quad,
+        # scaled by max_speed / max_yaw_rate and flown by MAVROS in GUIDED mode (AUTOPILOT=ardupilot only)
         self.action_space = gym.spaces.Box(
             low=-1.0,
             high=1.0,
-            shape=(1,), dtype=np.float32
+            shape=(4,), dtype=np.float32
         )
-        # [DUMMY] Observation Space is the Gazebo Sim /clock [seconds, nanoseconds]
+        # Observation Space, all float32 in the Gazebo world frame (ENU, meters):
+        #   [own position x,y,z; own velocity vx,vy,vz (estimated from ground-truth pose deltas);
+        #    goal offset dx,dy,dz] and then, for each additional drone, its position relative to own
+        self.obs_dim = 9 + 3 * max(self.NUM_DRONES - 1, 0)
         self.observation_space = gym.spaces.Box(
-            low=np.array([0.0, 0.0], dtype=np.float64),
-            high=np.array([np.inf, 1e9], dtype=np.float64),
-            dtype=np.float64
+            low=-np.inf,
+            high=np.inf,
+            shape=(self.obs_dim,), dtype=np.float32
         )
-        # Initialize storage for the clock
+        # Initialize storage for the clock and RL state
         self.sim_sec = 0.0
         self.sim_nanosec = 0.0
+        self.gz_model_names = self._gz_model_names(autopilot, num_quads)
+        if len(self.gz_model_names) == 0:
+            raise ValueError("AASEnv requires at least one drone")
+        self.reply_fmt = '<iI' + 'd' * (7 * len(self.gz_model_names))
+        self.pos_all = np.zeros((len(self.gz_model_names), 3), dtype=np.float64)  # All drones' world positions
+        self.prev_pos = None       # Own previous pose, for velocity estimation
+        self.prev_sim_time = None  # Clock [s] at the previous observation
+        self.vel_est = np.zeros(3, dtype=np.float64)
+        self.spawn_xy = np.zeros(2, dtype=np.float64)
+        self.goal = np.zeros(3, dtype=np.float64)
+        self.last_dt = 1.0 / self.GYM_FREQ_HZ
 
         self.max_steps = int(self.MAX_EPISODE_LENGTH_SEC*self.GYM_FREQ_HZ)  # Max steps per episode
         self.step_count = 0
@@ -59,6 +95,9 @@ class AASEnv(gym.Env):
         self.AUTOPILOT = autopilot
         if autopilot == "betaflight": # Betaflight SITL clock keeps running while Gazebo is paused between steps, and RTF is locked to 1
             raise ValueError("autopilot='betaflight' is not supported: the Betaflight SITL is not lockstepped with Gazebo")
+        if autopilot != "ardupilot":
+            print(f"Warning: RL velocity actuation (MAVROS GUIDED mode) is only wired for autopilot='ardupilot'; "
+                  f"with autopilot='{autopilot}' actions will be sent to the sim bridge but will not move the drone.")
         self.CAMERA = camera
         self.LIDAR = lidar
         self.ODOM = odom
@@ -283,11 +322,86 @@ class AASEnv(gym.Env):
             self.ZMQ_PORT = 5555
             self.ZMQ_IP = f"{self.SIM_SUBNET}.90.{self.SIM_ID}"
 
+    @staticmethod
+    def _gz_model_names(autopilot: str, num_quads: int) -> list:
+        # Must mirror the model naming of simulation/simulation.yml.erb (gym_models there):
+        # PX4 indexes models by 0-based instance, ArduPilot/Betaflight by 1-based drone_id
+        bases = {"px4": "x500", "ardupilot": "iris_with_ardupilot", "betaflight": "iris_with_betaflight"}
+        if autopilot not in bases:
+            raise ValueError(f"No Gazebo model name mapping for autopilot '{autopilot}'")
+        idx_offset = 0 if autopilot == "px4" else 1
+        return [f"{bases[autopilot]}_{i + idx_offset}" for i in range(num_quads)]
+
+    def _unpack_reply(self, reply_bytes):
+        # Clock (int32 sec, uint32 nanosec) followed by each configured model's ground-truth pose
+        # (x, y, z [m] and quaternion w, x, y, z) as doubles, matching zeromq_bridge.cpp
+        expected_len = struct.calcsize(self.reply_fmt)
+        if len(reply_bytes) != expected_len:
+            raise RuntimeError(
+                f"Unexpected ZMQ payload size: got {len(reply_bytes)} bytes, "
+                f"expected {expected_len} for {len(self.gz_model_names)} model(s). "
+                "Ensure the simulation image was rebuilt with the gym_models zmq_bridge parameter."
+            )
+        unpacked = struct.unpack(self.reply_fmt, reply_bytes)
+        sec, nanosec = unpacked[0], unpacked[1]
+        raw_poses = np.array(unpacked[2:], dtype=np.float64).reshape(-1, 7)
+        if not np.all(np.isfinite(raw_poses)):
+            missing = [self.gz_model_names[i] for i in range(len(raw_poses)) if not np.all(np.isfinite(raw_poses[i]))]
+            raise RuntimeError(
+                f"Ground-truth poses not available for model(s) {missing} from the ZMQ bridge. "
+                "Check that zmq_bridge_node logged a successful subscription to /dynamic_pose/info."
+            )
+        return sec, nanosec, raw_poses[:, :3]
+
+    def _update_from_payload(self, sec, nanosec, pos_all):
+        # Store the latest ground truth and estimate own velocity from pose deltas over exact sim time
+        self.sim_sec, self.sim_nanosec = sec, nanosec
+        sim_time = float(sec) + float(nanosec) * 1e-9
+        self.pos_all = pos_all
+        own_pos = pos_all[0]
+        nominal_dt = 1.0 / self.GYM_FREQ_HZ
+        dt = None
+        if self.prev_pos is not None and self.prev_sim_time is not None:
+            dt_candidate = sim_time - self.prev_sim_time
+            if 0.1 * nominal_dt <= dt_candidate <= 10.0 * nominal_dt:
+                dt = dt_candidate
+                self.vel_est = (own_pos - self.prev_pos) / dt
+        if dt is None:
+            dt = nominal_dt # First observation of an episode, or implausible clock delta
+        self.last_dt = dt
+        self.prev_pos = own_pos.copy()
+        self.prev_sim_time = sim_time
+
+    def _sample_goal(self):
+        # Random goal on an annulus around the spawn point, at roughly the current altitude
+        radius = self._np_random.uniform(*self.goal_range)
+        bearing = self._np_random.uniform(0.0, 2.0 * np.pi)
+        z_start = float(self.pos_all[0][2])
+        z_goal = min(max(z_start + self._np_random.uniform(-3.0, 3.0), 2.0), 80.0)
+        self.goal = self.spawn_xy + radius * np.array([np.cos(bearing), np.sin(bearing)], dtype=np.float64)
+        self.goal = np.array([self.goal[0], self.goal[1], z_goal], dtype=np.float64)
+
     def _get_obs(self):
-        return np.array([self.sim_sec, self.sim_nanosec], dtype=np.float64)
+        own_pos = self.pos_all[0]
+        goal_rel = self.goal - own_pos
+        obs_parts = [own_pos, self.vel_est, goal_rel]
+        for j in range(1, len(self.pos_all)):
+            obs_parts.append(self.pos_all[j] - own_pos)  # Other drones, relative to own position
+        return np.concatenate(obs_parts).astype(np.float32)
 
     def _get_info(self):
-        return {"sim_time_sec": self.sim_sec, "sim_time_nanosec": self.sim_nanosec}
+        own_pos = self.pos_all[0]
+        goal_rel = self.goal - own_pos
+        horizontal_distance = float(np.linalg.norm(goal_rel[:2]))
+        return {
+            "sim_time_sec": self.sim_sec,
+            "sim_time_nanosec": self.sim_nanosec,
+            "position": own_pos.copy(),
+            "velocity": self.vel_est.copy(),
+            "goal": self.goal.copy(),
+            "horizontal_distance_to_goal": horizontal_distance,
+            "vertical_error_to_goal": float(goal_rel[2]),
+        }
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)  # Handle seeding
@@ -332,11 +446,14 @@ class AASEnv(gym.Env):
                 try:
                     self.socket.send(action_payload) # Send the REQ
                     reply_bytes = self.socket.recv() # Wait for the REP (synchronous block) this call will block until a reply is received or it times out
-                    unpacked = struct.unpack('iI', reply_bytes) # Deserialize: i = int32 (sec), I = uint32 (nanosec)
-                    self.sim_sec, self.sim_nanosec = unpacked
-                    if self.sim_sec == 0 and self.sim_nanosec == 0:
+                    sec, nanosec, pos_all = self._unpack_reply(reply_bytes)
+                    if sec == 0 and nanosec == 0:
                         raise ValueError("Received zero-time payload (C++ bridge timeout).")
-                    self.start_sim_sec = float(self.sim_sec) + (float(self.sim_nanosec) * 1e-9)
+                    self.prev_pos = None  # Forget any stale state from the previous episode
+                    self.prev_sim_time = None
+                    self.vel_est = np.zeros(3, dtype=np.float64)
+                    self._update_from_payload(sec, nanosec, pos_all)
+                    self.start_sim_sec = float(sec) + (float(nanosec) * 1e-9)
                     break # Success
                 except zmq.error.Again:
                     print(f"ZMQ Error: Reply from container timed out. Attempt {attempt + 1} of 3.")
@@ -351,6 +468,10 @@ class AASEnv(gym.Env):
         ###########################################################################################
         ###########################################################################################
         ###########################################################################################
+        # The drone has just completed its unpaused init phase (takeoff included): record the spawn
+        # reference and sample this episode's random goal around it (goal sampling is seeded by reset(seed=...))
+        self.spawn_xy = self.pos_all[0][:2].copy()
+        self._sample_goal()
         self.step_count = 0
         
         if self.render_mode == "ansi":
@@ -359,18 +480,23 @@ class AASEnv(gym.Env):
         return self._get_obs(), self._get_info()
 
     def step(self, action):
-        force = action[0]
+        action = np.asarray(action, dtype=np.float32).reshape(4)
+        cmd = np.clip(action, -1.0, 1.0)
+        # Scale the normalized action to [vE, vN, vUp (m/s), yaw rate (rad/s)] in the world frame
+        vE = float(cmd[0]) * self.max_speed
+        vN = float(cmd[1]) * self.max_speed
+        vU = float(cmd[2]) * min(self.max_speed, 3.0)
+        yaw_rate = float(cmd[3]) * self.max_yaw_rate
         ###########################################################################################
         # ZeroMQ REQ/REP to the ROS2 sim ##########################################################
         ###########################################################################################
-        action_payload = struct.pack('d', force) # Serialize the action
+        action_payload = struct.pack('<ddddd', 0.0, vE, vN, vU, yaw_rate) # Serialize the step command
         for attempt in range(3):
             try:
                 self.socket.send(action_payload) # Send the REQ
                 reply_bytes = self.socket.recv() # Wait for the REP (synchronous block) this call will block until a reply is received or it times out
-                unpacked = struct.unpack('iI', reply_bytes) # Deserialize: i = int32 (sec), I = uint32 (nanosec)
-                self.sim_sec, self.sim_nanosec = unpacked
-                if self.sim_sec == 0 and self.sim_nanosec == 0:
+                sec, nanosec, pos_all = self._unpack_reply(reply_bytes)
+                if sec == 0 and nanosec == 0:
                     raise ValueError("Received zero-time payload (C++ bridge timeout).")
                 break # Success
             except zmq.error.Again:
@@ -384,11 +510,32 @@ class AASEnv(gym.Env):
         ###########################################################################################
         ###########################################################################################
         ###########################################################################################
+        # Reward shaping on progress toward the goal, evaluated between the previous and new states
+        # (both distances must use the same 3D metric for the potential shaping to telescope correctly)
+        d_prev = float(np.linalg.norm(self.goal - self.pos_all[0]))
+        self._update_from_payload(sec, nanosec, pos_all)
+        own_pos = self.pos_all[0]
+        d_cur_3d = np.linalg.norm(self.goal - own_pos)
+        d_cur_2d = float(np.linalg.norm(self.goal[:2] - own_pos[:2]))
+
+        reward = self.PROGRESS_GAIN * (d_prev - float(d_cur_3d)) + self.ALIVE_PENALTY_PER_SEC * self.last_dt
+        terminated = False
+
+        # Success: inside the goal radius
+        if d_cur_2d <= self.GOAL_RADIUS_M and abs(float(self.goal[2] - own_pos[2])) <= self.GOAL_ALT_TOL_M:
+            reward += self.SUCCESS_REWARD
+            terminated = True
+        # Crash or landing on the ground: faster contact costs more than a soft touchdown
+        elif own_pos[2] <= self.CRASH_AGL_M:
+            speed = float(np.linalg.norm(self.vel_est))
+            reward += self.CRASH_REWARD if speed > 3.0 else self.SOFT_LAND_REWARD
+            terminated = True
+        # Out-of-bounds flyaway
+        elif float(np.linalg.norm(own_pos[:2] - self.spawn_xy)) >= self.bounds_radius_m:
+            reward += self.OUT_OF_BOUNDS_REWARD
+            terminated = True
+
         self.step_count += 1
-        # Calculate reward
-        reward = float(-1.0)
-        # Check for termination
-        terminated = False  # This is a continuing task, never "terminates"
         # Check for truncation (episode ends due to time limit)
         truncated = self.step_count >= self.max_steps
         # Get obs and info

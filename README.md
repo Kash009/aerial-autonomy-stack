@@ -333,7 +333,13 @@ cd aerial-autonomy-stack/tools_and_docs/
 python3 gym_run.py --mode step                        # Manually step AAS @1Hz
 python3 gym_run.py --mode speedup                     # Speed-up test @50Hz
 python3 gym_run.py --mode vectorenv-speedup           # Vectorized speed-up test @50Hz
+
+# Train a PPO agent (goal-reaching task) on ArduPilot SITL
+python3 gym_run.py --mode learn --autopilot ardupilot --timesteps 200000
+python3 gym_run.py --mode learn --autopilot ardupilot --num-envs 2 --seed 1 --check-env   # 2 parallel instances (containers inst0/inst1)
 ```
+
+> **Note:** the observation is the drone's ground-truth pose (with velocity estimated from it) plus the goal offset; actions are normalized `[vE, vN, vUp, yaw_rate]` setpoints. Velocity actuation through MAVROS GUIDED mode is currently wired for `--autopilot ardupilot` only (other autopilots run but actions do not move the drone). Because the RL bridge code lives inside the Docker images (zmq_bridge node, tmux panes, relay script), rebuild the `simulation-image` and `aircraft-image` before using `--mode learn`, or `AASEnv.reset()` will report a payload mismatch.
 
 ## Appendix A: Citation
 

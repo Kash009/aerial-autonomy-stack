@@ -47,6 +47,21 @@
   gym_step_size = (physics_freq_hz / gym_freq_hz).to_i
   gym_step_size = 1 if gym_step_size < 1
 
+  # Gymnasium RL: Gazebo model names of the drones, in spawn order (must match the AASEnv naming logic,
+  # see _gz_model_names() in aas-gym/src/aas_gym/aas_env.py). The zmq_bridge collects their ground-truth poses.
+  gym_models = drones.each_with_index.map do |d, sitl_instance|
+    # Same per-autopilot naming used in the SITL windows below: PX4 indexes models by 0-based instance,
+    # ArduPilot and Betaflight index them by 1-based drone_id
+    idx = autopilot == 'px4' ? sitl_instance : sitl_instance + 1
+    "#{base_models[d[:type]]}_#{idx}"
+  end
+  # The RL action relay only drives the first quad (single-agent environment), through its MAVROS node;
+  # it is bound to UDP port 5870 + drone_id in that aircraft container (see rl_guided_relay.py)
+  gym_udp_target = ''
+  if autopilot == 'ardupilot' && num_quads > 0
+    gym_udp_target = "#{sim_subnet}.90.1:5871"
+  end
+
   # Load sensor information from the sensor_config.yaml file
   require 'yaml'
   sensor_config = YAML.load_file('/aas/simulation_resources/aircraft_models/sensor_config.yaml')
@@ -265,5 +280,5 @@ windows:
   - zmq_bridge:
       layout: even-horizontal
       panes:
-        - ros2 run zmq_bridge_cpp zmq_bridge_node --ros-args -p init_duration:=<%= gym_init_duration %> -p step_size:=<%= gym_step_size %> -p physics_dt:=<%= physics_dt %>
+        - ros2 run zmq_bridge_cpp zmq_bridge_node --ros-args -p init_duration:=<%= gym_init_duration %> -p step_size:=<%= gym_step_size %> -p physics_dt:=<%= physics_dt %> -p gym_models:="<%= gym_models.join(',') %>"<% if !gym_udp_target.empty? %> -p gym_udp_target:="<%= gym_udp_target %>"<% end %>
   <% end %>

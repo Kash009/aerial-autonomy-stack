@@ -5,10 +5,8 @@ import time
 import itertools
 import subprocess
 import shutil
-
-# from gymnasium.utils.env_checker import check_env
-# from stable_baselines3 import PPO
-# from stable_baselines3.common.env_checker import check_env as sb3_check_env
+import os
+from datetime import datetime
 
 from aas_gym.aas_env import AASEnv
 
@@ -28,6 +26,12 @@ def main():
     parser.add_argument("--lidar", action=argparse.BooleanOptionalAction, default=True, help="Enable/Disable Lidar")
     parser.add_argument("--num_quads", type=int, default=1)
     parser.add_argument("--gpu", action=argparse.BooleanOptionalAction, default=True, help="Enable/Disable GPU bindings")
+    # Options specific to --mode learn
+    parser.add_argument("--timesteps", type=int, default=200_000, help="Total RL training steps (environment interactions)")
+    parser.add_argument("--num-envs", type=int, default=1, help="Parallel AASEnv instances for RL training (instance IDs 0..num_envs-1)")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed applied to every env (episode goals and PPO)")
+    parser.add_argument("--model-name", type=str, default=None, help="Base name for the saved PPO model (default: aas_ppo_<timestamp>)")
+    parser.add_argument("--check-env", action=argparse.BooleanOptionalAction, default=False, help="Run the stable-baselines3 env checker before training")
     args = parser.parse_args()
 
     if args.mode == "step":
@@ -147,48 +151,78 @@ def main():
         envs.close()
 
     elif args.mode == "learn":
-        print("TODO")
-        # env = gym.make("AASEnv-v0")
-        # try:
-        #     # check_env(env) # Throws warning
-        #     # check_env(env.unwrapped)
-        #     sb3_check_env(env)
-        #     print("\nEnvironment passes all checks!")
-        # except Exception as e:
-        #     print(f"\nEnvironment has issues: {e}")
+        from stable_baselines3 import PPO
+        from stable_baselines3.common.monitor import Monitor
+        from stable_baselines3.common.vec_env import AsyncVectorEnv, DummyVecEnv
+        if args.check_env:
+            from stable_baselines3.common.env_checker import check_env as sb3_check_env
 
-        # env.reset()
-        # env.step(env.action_space.sample())
-        # env.reset()
+        if args.autopilot != "ardupilot":
+            print("WARNING: RL actuation (velocity setpoints through MAVROS GUIDED mode) is only implemented for --autopilot ardupilot.")
 
-        # # Instantiate the agent
-        # model = PPO("MlpPolicy", env, verbose=1, device='cpu')
+        def make_env(rank):
+            # Every AASEnv instance boots its own set of Docker containers on a unique subnet
+            env = gym.make(
+                "AASEnv-v0",
+                instance=rank,
+                gym_freq_hz=50,
+                autopilot=args.autopilot,
+                camera=args.camera,
+                lidar=args.lidar,
+                num_quads=args.num_quads,
+                render_mode=None,
+                gpu=args.gpu
+            )
+            return Monitor(env) # Adds episode/step/return logging usable by PPO callbacks
 
-        # # Train the agent
-        # print("Training agent...")
-        # model.learn(total_timesteps=40000)
-        # print("Training complete.")
+        if args.num_envs > 1:
+            print(f"Creating {args.num_envs} AASEnv instances (Docker containers for instances 0..{args.num_envs - 1})...")
+            venv = AsyncVectorEnv([make_env(rank) for rank in range(args.num_envs)])
+        else:
+            venv = DummyVecEnv([make_env(0)])
 
-        # # Save the agent
-        # model_path = "ppo_agent.zip"
-        # model.save(model_path)
-        # print(f"Model saved to {model_path}")
+        if args.seed is not None:
+            venv.seed(args.seed)
 
-        # # Load and test the trained agent
-        # del model # remove to demonstrate loading
-        # model = PPO.load(model_path, device='cpu')
+        if args.check_env and args.num_envs == 1:
+            # Reuse the single training env (already created) instead of booting a second container set
+            print("Running the stable-baselines3 environment checker on the training env (one extra ~80s reset)...")
+            try:
+                sb3_check_env(venv.envs[0].unwrapped, skip_render_check=True)
+                print("\nEnvironment passes all checks!")
+            except Exception as e:
+                print(f"\nEnvironment has issues: {e}")
 
-        # print("\nTesting trained agent...")
-        # obs, info = env.reset()
-        # for _ in range(800): # Run for 800 steps
-        #     action, _states = model.predict(obs, deterministic=True)
-        #     obs, reward, terminated, truncated, info = env.step(action)
-            
-        #     if terminated or truncated:
-        #         print("Episode finished. Resetting.")
-        #         obs, info = env.reset()
-        
-        # env.close()
+        model_name = args.model_name or f"aas_ppo_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        log_dir = os.path.join("rl_logs", model_name)
+        os.makedirs(log_dir, exist_ok=True)
+
+        # SB3 raises ImportError at learn() start if tensorboard_log is set but the package is missing (it's an optional extra)
+        tb_kwargs = {}
+        try:
+            from torch.utils.tensorboard import SummaryWriter  # noqa: F401
+            tb_kwargs["tensorboard_log"] = log_dir
+            print(f"PPO TensorBoard logs will be written to '{log_dir}' (visualize with 'tensorboard --logdir rl_logs').")
+        except ImportError:
+            print("Note: TensorBoard is not installed ('pip install stable-baselines3[tensorboard]'), training metrics will only be printed to stdout.")
+
+        model = PPO(
+            "MlpPolicy",
+            venv,
+            verbose=1,
+            device="auto",
+            seed=args.seed,
+            policy_kwargs=dict(net_arch=[256, 256]),
+            **tb_kwargs,
+        )
+
+        print(f"Training PPO for {args.timesteps} steps on the goal-reaching task (each episode starts with an ~80s unpaused init)...")
+        model.learn(total_timesteps=args.timesteps, progress_bar=True)
+
+        model_path = os.path.join(log_dir, f"{model_name}.zip")
+        model.save(model_path)
+        print(f"Model saved to {model_path}")
+        venv.close()
 
     else:
         print(f"Unknown mode: {args.mode}")
