@@ -14,17 +14,38 @@ CLEAN_BUILD="${CLEAN_BUILD:-false}" # Options: true, false (default), rebuild ev
 CLONE_ONLY="${CLONE_ONLY:-false}" # Options: true, false (default), clone the repos and skip the Docker builds
 PREBUILT_DEPS="${PREBUILT_DEPS:-false}" # Options: true, false (default), use the pre-built stages on ghcr.io for everything (including the steps added by BUILD_ADVANCED_ODOM=true) except aircraft-manifests/aircraft-dev-image
 BUILD_OPTS="${BUILD_OPTS:-}" # Extra `docker build` options, e.g. BUILD_OPTS=--progress=plain (default = none)
+CONTAINER_ENGINE="${CONTAINER_ENGINE:-auto}" # Options: auto, docker, podman (auto prefers docker if both are installed)
 
 # Check env variables
 source "${SCRIPT_DIR}/tests/check_env_vars.sh"
 for v in BUILD_ADVANCED_ODOM CLEAN_BUILD CLONE_ONLY PREBUILT_DEPS; do check_enum "$v" true false; done
+check_enum CONTAINER_ENGINE auto docker podman
 print_envvars
+
+# Resolve container engine (docker preferred, then podman)
+if [ "$CONTAINER_ENGINE" = "auto" ]; then
+  if command -v docker >/dev/null 2>&1; then
+    CONTAINER_ENGINE=docker
+  elif command -v podman >/dev/null 2>&1; then
+    CONTAINER_ENGINE=podman
+  else
+    abort "Neither docker nor podman found in PATH. Install one of them."
+  fi
+elif ! command -v "$CONTAINER_ENGINE" >/dev/null 2>&1; then
+  abort "$CONTAINER_ENGINE not found in PATH"
+fi
+export CONTAINER_ENGINE
+echo "Using container engine: $CONTAINER_ENGINE"
 
 if [ "$CLEAN_BUILD" = "true" ]; then
   rm -rf "${SCRIPT_DIR}/../_github_clones"
   BUILD_OPTS="$BUILD_OPTS --no-cache" # If CLEAN_BUILD is "true", rebuild everything from scratch
-  docker rmi aircraft-image:latest transitional-deps-image:latest ghcr.io/jacopopan/aircraft-image:deps-arm64 || true
-  docker builder prune -f # Remove all dangling build cache to free up space
+  ${CONTAINER_ENGINE} rmi aircraft-image:latest transitional-deps-image:latest ghcr.io/jacopopan/aircraft-image:deps-arm64 || true
+  if [ "$CONTAINER_ENGINE" = "podman" ]; then
+    podman image prune -f # Remove all dangling images to free up space (podman has no builder cache prune equivalent)
+  else
+    docker builder prune -f # Remove all dangling build cache to free up space
+  fi
 fi
 
 # Create a folder (ignored by git) to clone GitHub repos
@@ -87,11 +108,11 @@ if [ "$CLONE_ONLY" = "true" ]; then
   echo -e "Skipping Docker build"
 else
   if [ "$PREBUILT_DEPS" = "true" ]; then # Pull and tag with a local name all stages up to and including ros2-px4msgs-dds-mavros-yolo-ort-odom-analysis-models-image from ghcr.io
-    docker image inspect transitional-deps-image >/dev/null 2>&1 || { docker pull ghcr.io/jacopopan/aircraft-image:deps-arm64 && docker tag ghcr.io/jacopopan/aircraft-image:deps-arm64 transitional-deps-image; }
+    ${CONTAINER_ENGINE} image inspect transitional-deps-image >/dev/null 2>&1 || { ${CONTAINER_ENGINE} pull ghcr.io/jacopopan/aircraft-image:deps-arm64 && ${CONTAINER_ENGINE} tag ghcr.io/jacopopan/aircraft-image:deps-arm64 transitional-deps-image; }
     BUILD_OPTS="$BUILD_OPTS --build-context ros2-px4msgs-dds-mavros-yolo-ort-odom-analysis-models-image=docker-image://transitional-deps-image"
   else
     # Keep the base image local, so cached builds also work offline
-    docker image inspect nvcr.io/nvidia/cuda:13.3.1-tensorrt-devel-ubuntu24.04 >/dev/null 2>&1 || docker pull nvcr.io/nvidia/cuda:13.3.1-tensorrt-devel-ubuntu24.04
+    ${CONTAINER_ENGINE} image inspect nvcr.io/nvidia/cuda:13.3.1-tensorrt-devel-ubuntu24.04 >/dev/null 2>&1 || ${CONTAINER_ENGINE} pull nvcr.io/nvidia/cuda:13.3.1-tensorrt-devel-ubuntu24.04
   fi
-  docker build $BUILD_OPTS --build-arg BUILD_ADVANCED_ODOM="${BUILD_ADVANCED_ODOM}" -t aircraft-image -f "${SCRIPT_DIR}/docker/aircraft.dockerfile" "${SCRIPT_DIR}/.."
+  ${CONTAINER_ENGINE} build $BUILD_OPTS --build-arg BUILD_ADVANCED_ODOM="${BUILD_ADVANCED_ODOM}" -t aircraft-image -f "${SCRIPT_DIR}/docker/aircraft.dockerfile" "${SCRIPT_DIR}/.."
 fi

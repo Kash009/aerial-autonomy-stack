@@ -44,8 +44,11 @@ TAIL_IDS="${TAIL_IDS:-}" # Comma-separated DRONE_IDs of the tailsitters, e.g. TA
 # Find the script's path
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
+CONTAINER_ENGINE="${CONTAINER_ENGINE:-auto}" # Options: auto, docker, podman (note: --runtime nvidia below still requires the NVIDIA Container Runtime)
+
 # Check env variables
 source "${SCRIPT_DIR}/tests/check_env_vars.sh"
+check_enum CONTAINER_ENGINE auto docker podman
 check_enum AUTOPILOT px4 ardupilot betaflight
 check_enum ODOM none openvins fastlio superodom mimosa
 check_enum DRONE_TYPE quad vtol tail
@@ -59,13 +62,28 @@ for id in ${QUAD_IDS//,/ } ${VTOL_IDS//,/ } ${TAIL_IDS//,/ } $DRONE_ID; do (( id
 for v in SIM_ID GROUND_ID; do check_int "$v" 100 101; done
 print_envvars
 
+# Resolve container engine (docker preferred, then podman)
+if [[ "$CONTAINER_ENGINE" == "auto" ]]; then
+  if command -v docker >/dev/null 2>&1; then
+    CONTAINER_ENGINE=docker
+  elif command -v podman >/dev/null 2>&1; then
+    CONTAINER_ENGINE=podman
+  else
+    abort "Neither docker nor podman found in PATH. Install one of them."
+  fi
+elif ! command -v "$CONTAINER_ENGINE" >/dev/null 2>&1; then
+  abort "$CONTAINER_ENGINE not found in PATH"
+fi
+export CONTAINER_ENGINE
+echo "Using container engine: $CONTAINER_ENGINE"
+
 if [[ "$GROUND" == "true" ]]; then
   # This is a bit hacky, but allows using the deploy_run.sh script for the ground container
   # Without GPU requirements: --device /dev/dri --gpus all --env NVIDIA_DRIVER_CAPABILITIES=all
   # Forcing HEADLESS to false, opening REMOTE_VIDEO_STREAMS and SSH_CONNECTIONS
   # GND_TELEM_BAUD=230400 for use with point-to-multipoint Microhard telemetry
   xhost +local:docker # Grant access to the X server
-  docker run -it --rm \
+  ${CONTAINER_ENGINE} run -it --rm \
     --volume /tmp/.X11-unix:/tmp/.X11-unix:rw \
     --env DISPLAY=$DISPLAY --env QT_X11_NO_MITSHM=1 --env XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR \
     --env HEADLESS=false --env AUTOPILOT=$AUTOPILOT \
@@ -103,17 +121,17 @@ else
   DOCKER_RUN_FLAGS="-d -t" # Detached mode
   if [[ "$DEV" == "true" ]]; then
     echo -e "\nWith DEV=true, attach directly to the bash shell:\n"
-    echo -e "\t docker exec -it aircraft-container_$DRONE_ID bash\n"
+    echo -e "\t ${CONTAINER_ENGINE} exec -it aircraft-container_$DRONE_ID bash\n"
   else
     echo -e "\nAttach to the Tmux session in the running 'aircraft-container':\n"
-    echo -e "\t docker exec -it aircraft-container_$DRONE_ID tmux attach\n"
+    echo -e "\t ${CONTAINER_ENGINE} exec -it aircraft-container_$DRONE_ID tmux attach\n"
   fi
   echo -e "To stop all containers and remove stopped containers:\n"
-  echo -e '\t docker ps -q | xargs -r docker stop && docker container prune -f\n'
+  echo -e "\t ${CONTAINER_ENGINE} ps -q | xargs -r ${CONTAINER_ENGINE} stop && ${CONTAINER_ENGINE} container prune -f\n"
 fi
 
 # Launch the aircraft container
-docker run $DOCKER_RUN_FLAGS \
+${CONTAINER_ENGINE} run $DOCKER_RUN_FLAGS \
   --runtime nvidia \
   --volume /tmp/.X11-unix:/tmp/.X11-unix:rw --device /dev/dri --gpus all \
   --volume /tmp/argus_socket:/tmp/argus_socket --volume ~/tensorrt_cache/:/tensorrt_cache --device=/dev/ttyTHS1:/dev/ttyTHS1 \

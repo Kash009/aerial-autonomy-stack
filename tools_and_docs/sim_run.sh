@@ -30,6 +30,8 @@ START_AS_PAUSED="${START_AS_PAUSED:-false}" # Options: true, false (default)
 INSTANCE="${INSTANCE:-0}" # Integer ID to make docker network/container names unique as well as offsetting the second byte of the subnets (default = 0)
 # Note: the analysis/plotting env variable is used by this script on cleanup and NOT passed to any container
 PLOT="${PLOT:-false}" # Options: true, false (default)
+CONTAINER_ENGINE="${CONTAINER_ENGINE:-auto}" # Options: auto (use docker if installed, else podman), docker, podman
+GPU_VENDOR="${GPU_VENDOR:-auto}" # Options: auto (nvidia if detected, else amd when /dev/kfd is present), nvidia, amd
 
 # Detect the environment (Ubuntu/GNOME, WSL, etc.)
 if echo "$XDG_CURRENT_DESKTOP" | grep -qi "gnome"; then
@@ -56,9 +58,73 @@ if [[ "$AUTOPILOT" == "betaflight" ]] && [[ "$HITL" == "true" || "$PLOT" == "tru
 for v in SIM_ID GROUND_ID; do check_int "$v" 100 101; done
 check_int INSTANCE 0 99
 check_num RTF
+check_enum CONTAINER_ENGINE auto docker podman
+check_enum GPU_VENDOR auto nvidia amd
 if [[ "$PX4_ROS2_LIB" == "true" && "$RTF" != "1.0" ]]; then echo "WARNING: PX4_ROS2_LIB=true sets RTF=1.0 (was RTF=$RTF)" >&2; RTF=1.0; fi
 if [[ "$AUTOPILOT" == "betaflight" && "$RTF" != "1.0" ]]; then echo "WARNING: AUTOPILOT=betaflight sets RTF=1.0 (was RTF=$RTF)" >&2; RTF=1.0; fi
 print_envvars
+
+# Resolve the container engine (docker preferred, then podman)
+if [[ "$CONTAINER_ENGINE" == "auto" ]]; then
+  if command -v docker >/dev/null 2>&1; then
+    CONTAINER_ENGINE=docker
+  elif command -v podman >/dev/null 2>&1; then
+    CONTAINER_ENGINE=podman
+  else
+    abort "Neither docker nor podman found in PATH. Install one of them."
+  fi
+elif ! command -v "$CONTAINER_ENGINE" >/dev/null 2>&1; then
+  abort "$CONTAINER_ENGINE not found in PATH"
+fi
+export CONTAINER_ENGINE
+
+# Resolve the GPU vendor on this Linux host (WSL only exposes NVIDIA ROCm-free paths, so AMD assumes a native Linux host)
+if [[ "$GPU_VENDOR" == "auto" ]]; then
+  if command -v nvidia-smi >/dev/null 2>&1 || [[ -e /dev/nvidia0 ]]; then
+    GPU_VENDOR=nvidia
+  elif [[ -e /dev/kfd ]]; then
+    GPU_VENDOR=amd
+  else
+    echo "WARNING: could not detect a discrete GPU, assuming nvidia" >&2
+    GPU_VENDOR=nvidia
+  fi
+fi
+export GPU_VENDOR
+echo "Container engine: $CONTAINER_ENGINE | GPU vendor: $GPU_VENDOR"
+
+# Per-engine + per-vendor device flags, driver env vars, and SELinux labeling options.
+# NOTE: podman + NVIDIA requires a CDI spec once (needs root): sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
+if [[ "$CONTAINER_ENGINE" == "podman" ]]; then
+  if [[ "$GPU_VENDOR" == "amd" ]]; then
+    GPU_DEVICE_OPTS="--device /dev/dri --device /dev/kfd"
+  else
+    GPU_DEVICE_OPTS="--device nvidia.com/gpu=all --device /dev/dri"
+  fi
+  # Containers bind-mount host devices and shm; disable SELinux labeling when it is active on the host
+  if [[ -d /sys/fs/selinux ]]; then
+    SELINUX_OPTS="--security-opt label=disable"
+  else
+    SELINUX_OPTS=""
+  fi
+  if [[ $EUID -ne 0 ]]; then
+    echo "Note: running rootless podman. For GPU access your user must be in the 'render' and 'video' groups;" >&2
+    echo "for audio, a running pipewire/pulse instance. Use rootful podman if devices are not visible in containers."
+  fi
+else
+  if [[ "$GPU_VENDOR" == "amd" ]]; then
+    GPU_DEVICE_OPTS="--device /dev/dri --device /dev/kfd"
+  else
+    GPU_DEVICE_OPTS="--device /dev/dri --gpus all"
+  fi
+  SELINUX_OPTS=""
+fi
+
+# NVIDIA driver env vars are only needed on docker (podman picks them up from the CDI spec) and never apply to AMD
+if [[ "$GPU_VENDOR" == "nvidia" && "$CONTAINER_ENGINE" == "docker" ]]; then
+  GPU_ENV="--env NVIDIA_DRIVER_CAPABILITIES=all --env __NV_PRIME_RENDER_OFFLOAD=1 --env __GLX_VENDOR_LIBRARY_NAME=nvidia"
+else
+  GPU_ENV=""
+fi
 
 # Set unique subnets and container/network names based on INSTANCE
 SIM_BYTE_1=$(echo "$SIM_SUBNET" | cut -d'.' -f1)
@@ -88,10 +154,10 @@ if [[ "$DEV" == "true" ]]; then
   DEV_AIR_OPTS+=" -v ~/Downloads/:/aas/mounted_downloads_folder:cached"
 fi
 
-# Create docker networks for SITL
+# Create container networks for SITL
 if [[ "$HITL" == "false" ]]; then
-  docker network inspect $SIM_NET_NAME >/dev/null 2>&1 || docker network create --subnet=${SIM_SUBNET}.0.0/16 $SIM_NET_NAME
-  docker network inspect $AIR_NET_NAME >/dev/null 2>&1 || docker network create --subnet=${AIR_SUBNET}.0.0/16 $AIR_NET_NAME
+  ${CONTAINER_ENGINE} network inspect $SIM_NET_NAME >/dev/null 2>&1 || ${CONTAINER_ENGINE} network create --subnet=${SIM_SUBNET}.0.0/16 $SIM_NET_NAME
+  ${CONTAINER_ENGINE} network inspect $AIR_NET_NAME >/dev/null 2>&1 || ${CONTAINER_ENGINE} network create --subnet=${AIR_SUBNET}.0.0/16 $AIR_NET_NAME
 fi
 
 # Grant access to the X server
@@ -138,10 +204,9 @@ XTERM_CONFIG_ARGS=(
 )
 
 # Launch the simulation container
-DOCKER_CMD="docker run -it --rm \
-  --volume /tmp/.X11-unix:/tmp/.X11-unix:rw --device /dev/dri --gpus all \
-  --env DISPLAY=$DISPLAY --env QT_X11_NO_MITSHM=1 --env NVIDIA_DRIVER_CAPABILITIES=all --env XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR --env GST_DEBUG=3 \
-  --env __NV_PRIME_RENDER_OFFLOAD=1 --env __GLX_VENDOR_LIBRARY_NAME=nvidia \
+DOCKER_CMD="${CONTAINER_ENGINE} run -it --rm \
+  --volume /tmp/.X11-unix:/tmp/.X11-unix:rw ${GPU_DEVICE_OPTS} ${SELINUX_OPTS} \
+  --env DISPLAY=$DISPLAY --env QT_X11_NO_MITSHM=1 --env XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR --env GST_DEBUG=3 ${GPU_ENV} \
   --env AUTOPILOT=$AUTOPILOT --env HEADLESS=$HEADLESS --env CAMERA=$CAMERA --env LIDAR=$LIDAR \
   --env NUM_QUADS=$NUM_QUADS --env NUM_VTOLS=$NUM_VTOLS --env NUM_TAILS=$NUM_TAILS --env WORLD=$WORLD \
   --env SIMULATED_TIME=true --env RTF=$RTF --env START_AS_PAUSED=$START_AS_PAUSED \
@@ -171,10 +236,9 @@ if [[ "$HITL" == "false" ]]; then
   if [[ "$GND_CONTAINER" == "true" ]]; then
     sleep 1.0 # Limit resource usage
     # Launch the ground container
-    DOCKER_CMD="docker run -it --rm \
-      --volume /tmp/.X11-unix:/tmp/.X11-unix:rw --device /dev/dri --gpus all \
-      --env DISPLAY=$DISPLAY --env QT_X11_NO_MITSHM=1 --env NVIDIA_DRIVER_CAPABILITIES=all --env XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR --env GST_DEBUG=3 \
-      --env __NV_PRIME_RENDER_OFFLOAD=1 --env __GLX_VENDOR_LIBRARY_NAME=nvidia \
+    DOCKER_CMD="${CONTAINER_ENGINE} run -it --rm \
+      --volume /tmp/.X11-unix:/tmp/.X11-unix:rw ${GPU_DEVICE_OPTS} ${SELINUX_OPTS} \
+      --env DISPLAY=$DISPLAY --env QT_X11_NO_MITSHM=1 --env XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR --env GST_DEBUG=3 ${GPU_ENV} \
       --env HEADLESS=$HEADLESS --env AUTOPILOT=$AUTOPILOT \
       --env QUAD_IDS=$(seq -s, 1 $NUM_QUADS) \
       --env VTOL_IDS=$(seq -s, $((NUM_QUADS + 1)) $((NUM_QUADS + NUM_VTOLS))) \
@@ -206,10 +270,9 @@ if [[ "$HITL" == "false" ]]; then
     for i in $(seq 1 $num_drones); do
       sleep 1.0 # Limit resource usage
       local NAME_AIRCRAFT_CNT="aircraft-container-inst${INSTANCE}_${DRONE_ID}"
-      DOCKER_CMD="docker run -it --rm \
-        --volume /tmp/.X11-unix:/tmp/.X11-unix:rw --device /dev/dri --gpus all \
-        --env DISPLAY=$DISPLAY --env QT_X11_NO_MITSHM=1 --env NVIDIA_DRIVER_CAPABILITIES=all --env XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR --env GST_DEBUG=3 \
-        --env __NV_PRIME_RENDER_OFFLOAD=1 --env __GLX_VENDOR_LIBRARY_NAME=nvidia \
+      DOCKER_CMD="${CONTAINER_ENGINE} run -it --rm \
+        --volume /tmp/.X11-unix:/tmp/.X11-unix:rw ${GPU_DEVICE_OPTS} ${SELINUX_OPTS} \
+        --env DISPLAY=$DISPLAY --env QT_X11_NO_MITSHM=1 --env XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR --env GST_DEBUG=3 ${GPU_ENV} \
         --env AUTOPILOT=$AUTOPILOT --env HEADLESS=$HEADLESS --env CAMERA=$CAMERA --env LIDAR=$LIDAR --env ODOM=$ODOM --env PX4_ROS2_LIB=$PX4_ROS2_LIB \
         --env DRONE_TYPE=$drone_type --env DRONE_ID=$DRONE_ID \
         --env SIMULATED_TIME=true \
@@ -240,9 +303,9 @@ if [[ "$HITL" == "false" ]]; then
 
   if [[ "$GND_CONTAINER" == "true" ]]; then
     sleep 2.0 # Once all containers are up, connect ground and aircraft containers to the air network
-    docker network connect --ip=${AIR_SUBNET}.90.$GROUND_ID $AIR_NET_NAME $GND_CONT_NAME
+    ${CONTAINER_ENGINE} network connect --ip=${AIR_SUBNET}.90.$GROUND_ID $AIR_NET_NAME $GND_CONT_NAME
     for i in $(seq 1 $((NUM_QUADS + NUM_VTOLS + NUM_TAILS))); do
-      docker network connect --ip=${AIR_SUBNET}.90.$i $AIR_NET_NAME "aircraft-container-inst${INSTANCE}_${i}"
+      ${CONTAINER_ENGINE} network connect --ip=${AIR_SUBNET}.90.$i $AIR_NET_NAME "aircraft-container-inst${INSTANCE}_${i}"
     done
   fi
 fi
@@ -266,9 +329,9 @@ cleanup() {
     elif [ "$AUTOPILOT" == "betaflight" ]; then
       continue # No SITL flight log
     fi
-    LATEST_LOG=$(docker exec "$SIM_CONT_NAME" bash -c "ls -t $LOG_GLOB 2>/dev/null | head -n 1" || true)
+    LATEST_LOG=$(${CONTAINER_ENGINE} exec "$SIM_CONT_NAME" bash -c "ls -t $LOG_GLOB 2>/dev/null | head -n 1" || true)
     if [ -n "$LATEST_LOG" ]; then
-      docker cp "${SIM_CONT_NAME}:${LATEST_LOG}" "${PLOT_DIR}/drone_${i}.${LATEST_LOG##*.}" >/dev/null 2>&1 \
+      ${CONTAINER_ENGINE} cp "${SIM_CONT_NAME}:${LATEST_LOG}" "${PLOT_DIR}/drone_${i}.${LATEST_LOG##*.}" >/dev/null 2>&1 \
         && echo "Copied drone $i log: $(basename "$LATEST_LOG")" || echo "Could not copy the log of drone $i"
     else
       echo "No log found for drone $i"
@@ -277,14 +340,14 @@ cleanup() {
   # Copy the aircraft rosbags (if recorded) to the host
   if [[ "$RECORD_ROSBAG" == "true" ]]; then
     for i in $(seq 1 $NUM_DRONES); do
-      docker exec "aircraft-container-inst${INSTANCE}_${i}" tmux send-keys -t logging.0 C-c >/dev/null 2>&1 || true
+      ${CONTAINER_ENGINE} exec "aircraft-container-inst${INSTANCE}_${i}" tmux send-keys -t logging.0 C-c >/dev/null 2>&1 || true
     done
     sleep 2 # Wait for ros2 bag to close the file and write metadata.yaml
     for i in $(seq 1 $NUM_DRONES); do
       AIR_CONT="aircraft-container-inst${INSTANCE}_${i}"
-      LATEST_BAG=$(docker exec "$AIR_CONT" bash -c "ls -td /aas/rosbags/* 2>/dev/null | head -n 1" || true)
+      LATEST_BAG=$(${CONTAINER_ENGINE} exec "$AIR_CONT" bash -c "ls -td /aas/rosbags/* 2>/dev/null | head -n 1" || true)
       if [ -n "$LATEST_BAG" ]; then
-        docker cp "${AIR_CONT}:${LATEST_BAG}" "${PLOT_DIR}/drone_${i}_rosbag" >/dev/null 2>&1 \
+        ${CONTAINER_ENGINE} cp "${AIR_CONT}:${LATEST_BAG}" "${PLOT_DIR}/drone_${i}_rosbag" >/dev/null 2>&1 \
           && echo "Copied drone $i rosbag: $(basename "$LATEST_BAG")" || echo "Could not copy the rosbag of drone $i"
       else
         echo "No rosbag found for drone $i"
@@ -292,17 +355,17 @@ cleanup() {
     done
   fi
   # Cleanup
-  DOCKER_PIDS=$(pgrep -f "docker run.*inst${INSTANCE}([^0-9]|$)" 2>/dev/null || true)
+  DOCKER_PIDS=$(pgrep -f "${CONTAINER_ENGINE} run.*inst${INSTANCE}([^0-9]|$)" 2>/dev/null || true)
   CONTAINER_NAMES=("${SIM_CONT_NAME}" "${GND_CONT_NAME}" "aircraft-container-inst${INSTANCE}")
-  echo "Stopping Docker containers (this will take a few seconds)..."
+  echo "Stopping ${CONTAINER_ENGINE} containers (this will take a few seconds)..."
   for name in "${CONTAINER_NAMES[@]}"; do
-      CIDS=$(docker ps -a -q --filter name="^${name}(_.*)?$" 2>/dev/null || true)
+      CIDS=$(${CONTAINER_ENGINE} ps -a -q --filter name="^${name}(_.*)?$" 2>/dev/null || true)
       for CID in $CIDS; do
         if [ -n "$CID" ]; then
-          CNT_NAME=$(docker inspect --format="{{.Name}}" "$CID" | sed 's/^\///')
+          CNT_NAME=$(${CONTAINER_ENGINE} inspect --format="{{.Name}}" "$CID" | sed 's/^\///')
           echo "Removing $CNT_NAME..."
-          docker stop -t 1 $CID >/dev/null 2>&1 || true # If needed, increase timeout -t to avoid NVIDIA driver panic
-          docker rm $CID >/dev/null 2>&1 || true
+          ${CONTAINER_ENGINE} stop -t 1 $CID >/dev/null 2>&1 || true # If needed, increase timeout -t to avoid GPU driver panic
+          ${CONTAINER_ENGINE} rm $CID >/dev/null 2>&1 || true
         fi
       done
   done
@@ -315,8 +378,8 @@ cleanup() {
       fi
     done
   fi
-  docker network rm $SIM_NET_NAME 2>/dev/null && echo "Removed $SIM_NET_NAME" || echo "Network $SIM_NET_NAME not found or already removed"
-  docker network rm $AIR_NET_NAME 2>/dev/null && echo "Removed $AIR_NET_NAME" || echo "Network $AIR_NET_NAME not found or already removed"
+  ${CONTAINER_ENGINE} network rm $SIM_NET_NAME 2>/dev/null && echo "Removed $SIM_NET_NAME" || echo "Network $SIM_NET_NAME not found or already removed"
+  ${CONTAINER_ENGINE} network rm $AIR_NET_NAME 2>/dev/null && echo "Removed $AIR_NET_NAME" || echo "Network $AIR_NET_NAME not found or already removed"
   if command -v xhost >/dev/null 2>&1; then
     sleep 1 && xhost -local:docker >/dev/null
   fi

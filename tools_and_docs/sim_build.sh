@@ -11,18 +11,42 @@ BUILD_ADVANCED_ODOM="${BUILD_ADVANCED_ODOM:-false}" # Options: true, false (defa
 CLEAN_BUILD="${CLEAN_BUILD:-false}" # Options: true, false (default), rebuild everything from scratch
 CLONE_ONLY="${CLONE_ONLY:-false}" # Options: true, false (default), clone the repos and skip the Docker builds
 BUILD_OPTS="${BUILD_OPTS:-}" # Extra `docker build` options, e.g. BUILD_OPTS=--progress=plain (default = none)
+CONTAINER_ENGINE="${CONTAINER_ENGINE:-auto}" # Options: auto, docker, podman (auto prefers docker if both are installed)
 
 # Check env variables
 source "${SCRIPT_DIR}/tests/check_env_vars.sh"
 for v in BUILD_ADVANCED_ODOM CLEAN_BUILD CLONE_ONLY; do check_enum "$v" true false; done
+check_enum CONTAINER_ENGINE auto docker podman
 print_envvars
+
+# Resolve container engine (docker preferred, then podman)
+if [ "$CONTAINER_ENGINE" = "auto" ]; then
+  if command -v docker >/dev/null 2>&1; then
+    CONTAINER_ENGINE=docker
+  elif command -v podman >/dev/null 2>&1; then
+    CONTAINER_ENGINE=podman
+  else
+    abort "Neither docker nor podman found in PATH. Install one of them."
+  fi
+elif ! command -v "$CONTAINER_ENGINE" >/dev/null 2>&1; then
+  abort "$CONTAINER_ENGINE not found in PATH"
+fi
+export CONTAINER_ENGINE
+echo "Using container engine: $CONTAINER_ENGINE"
+
+# --provenance is a buildx-only flag; podman build rejects it
+if [ "$CONTAINER_ENGINE" = "podman" ]; then PROVENANCE_OPTS=""; else PROVENANCE_OPTS="--provenance=false"; fi
 
 if [ "$CLEAN_BUILD" = "true" ]; then
   rm -rf "${SCRIPT_DIR}/../_github_clones"
   BUILD_OPTS="$BUILD_OPTS --no-cache" # If CLEAN_BUILD is "true", rebuild everything from scratch
-  docker rmi transitional-ros2-image:latest transitional-ros2-gcs-image:latest \
+  ${CONTAINER_ENGINE} rmi transitional-ros2-image:latest transitional-ros2-gcs-image:latest \
     aircraft-image:latest ground-image:latest simulation-image:latest || true
-  docker builder prune -f # Remove all dangling build cache to free up space
+  if [ "$CONTAINER_ENGINE" = "podman" ]; then
+    podman image prune -f # Remove all dangling images to free up space (podman has no builder cache prune equivalent)
+  else
+    docker builder prune -f # Remove all dangling build cache to free up space
+  fi
 fi
 
 # Create a folder (ignored by git) to clone GitHub repos
@@ -121,12 +145,12 @@ if [ "$CLONE_ONLY" = "true" ]; then
   echo -e "Skipping Docker builds"
 else
   # Keep the base images local, so cached builds also work offline
-  for img in nvcr.io/nvidia/cuda:13.3.1-cudnn-runtime-ubuntu24.04 ubuntu:24.04; do docker image inspect "$img" >/dev/null 2>&1 || docker pull "$img"; done
+  for img in nvcr.io/nvidia/cuda:13.3.1-cudnn-runtime-ubuntu24.04 ubuntu:24.04; do ${CONTAINER_ENGINE} image inspect "$img" >/dev/null 2>&1 || ${CONTAINER_ENGINE} pull "$img"; done
   # Build common layers reused between images
-  docker build $BUILD_OPTS --provenance=false --target ros2-image -t transitional-ros2-image -f "${SCRIPT_DIR}/docker/aircraft.dockerfile" "${SCRIPT_DIR}/.."
-  docker build $BUILD_OPTS --provenance=false --target ros2-gcs-image -t transitional-ros2-gcs-image -f "${SCRIPT_DIR}/docker/ground.dockerfile" "${SCRIPT_DIR}/.."
+  ${CONTAINER_ENGINE} build $BUILD_OPTS ${PROVENANCE_OPTS} --target ros2-image -t transitional-ros2-image -f "${SCRIPT_DIR}/docker/aircraft.dockerfile" "${SCRIPT_DIR}/.."
+  ${CONTAINER_ENGINE} build $BUILD_OPTS ${PROVENANCE_OPTS} --target ros2-gcs-image -t transitional-ros2-gcs-image -f "${SCRIPT_DIR}/docker/ground.dockerfile" "${SCRIPT_DIR}/.."
   # Build the 3 main images
-  docker build $BUILD_OPTS --build-arg BUILD_ADVANCED_ODOM="${BUILD_ADVANCED_ODOM}" -t aircraft-image -f "${SCRIPT_DIR}/docker/aircraft.dockerfile" "${SCRIPT_DIR}/.."
-  docker build $BUILD_OPTS -t ground-image -f "${SCRIPT_DIR}/docker/ground.dockerfile" "${SCRIPT_DIR}/.."
-  docker build $BUILD_OPTS -t simulation-image -f "${SCRIPT_DIR}/docker/simulation.dockerfile" "${SCRIPT_DIR}/.."
+  ${CONTAINER_ENGINE} build $BUILD_OPTS --build-arg BUILD_ADVANCED_ODOM="${BUILD_ADVANCED_ODOM}" -t aircraft-image -f "${SCRIPT_DIR}/docker/aircraft.dockerfile" "${SCRIPT_DIR}/.."
+  ${CONTAINER_ENGINE} build $BUILD_OPTS -t ground-image -f "${SCRIPT_DIR}/docker/ground.dockerfile" "${SCRIPT_DIR}/.."
+  ${CONTAINER_ENGINE} build $BUILD_OPTS -t simulation-image -f "${SCRIPT_DIR}/docker/simulation.dockerfile" "${SCRIPT_DIR}/.."
 fi

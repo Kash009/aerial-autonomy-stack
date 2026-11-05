@@ -31,11 +31,25 @@ fi
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 GYM_RUN_SCRIPT="$SCRIPT_DIR/../gym_run.py"
 
-# Docker clean-up helper function
+# Resolve container engine (docker preferred, then podman), same convention as sim_run.sh/sim_build.sh
+CONTAINER_ENGINE="${CONTAINER_ENGINE:-auto}"
+if [[ "$CONTAINER_ENGINE" == "auto" ]]; then
+    if command -v docker >/dev/null 2>&1; then
+        CONTAINER_ENGINE=docker
+    elif command -v podman >/dev/null 2>&1; then
+        CONTAINER_ENGINE=podman
+    else
+        echo "Error: neither docker nor podman found in PATH."
+        exit 1
+    fi
+fi
+echo "Container engine: $CONTAINER_ENGINE"
+
+# Container clean-up helper function
 cleanup_docker() {
-    docker ps -q | xargs -r docker stop >/dev/null 2>&1
-    docker container prune -f >/dev/null 2>&1
-    docker network prune -f >/dev/null 2>&1
+    ${CONTAINER_ENGINE} ps -q | xargs -r ${CONTAINER_ENGINE} stop >/dev/null 2>&1
+    ${CONTAINER_ENGINE} container prune -f >/dev/null 2>&1
+    ${CONTAINER_ENGINE} network prune -f >/dev/null 2>&1
     # Wait to let the os release socket file handles
     sleep 3
 }
@@ -78,6 +92,7 @@ suite_start_time=$(date +%s)
                                 --autopilot "$autopilot" \
                                 --num_quads "$quads" \
                                 --repetitions 1 \
+                                --engine "$CONTAINER_ENGINE" \
                                 $sensor_flags 2>&1)
 
                             exit_code=$?

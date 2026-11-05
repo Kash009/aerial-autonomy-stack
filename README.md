@@ -82,7 +82,12 @@ NUM_QUADS=1 NUM_VTOLS=1 WORLD=swiss_town RTF=3 PLOT=true ./sim_run.sh    # Start
 #  RTF=1, 2, ... (real-time-factor, use 0 for "as fast as possible", PX4_ROS2_LIB=true or AUTOPILOT=betaflight set RTF=1)
 #  INSTANCE=0, 1, ... (integer ID to run multiple parallel simulations)
 #  PLOT/RECORD_ROSBAG=true, false (plotting requires pymavlink, pyulog, pymap3d)
+#  CONTAINER_ENGINE=docker, podman (default "auto": docker if installed, otherwise podman)
+#  GPU_VENDOR=nvidia, amd (default "auto", detects /dev/kfd for AMD ROCm GPUs)
 ```
+
+> [!NOTE]
+> Podman and AMD GPUs are supported: `CONTAINER_ENGINE=podman GPU_VENDOR=amd ./sim_run.sh`. The same variables apply to `sim_build.sh`/`deploy_*.sh`. With Podman on Fedora/RHEL, SELinux labeling is disabled automatically; for NVIDIA under Podman, generate a CDI spec once (`sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml`). See [Container engine and GPU vendor](#container-engine-and-gpu-vendor) in section 4.
 
 There are **3 different ways** to autonomously fly the drones (plus USB gamepad for manual flight and QGroundControl/Betaflight App for operator supervision)
 
