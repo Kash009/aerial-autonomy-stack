@@ -339,6 +339,22 @@ python3 gym_run.py --mode learn --autopilot ardupilot --timesteps 200000
 python3 gym_run.py --mode learn --autopilot ardupilot --num-envs 2 --seed 1 --check-env   # 2 parallel instances (containers inst0/inst1)
 ```
 
+### Container engine and GPU vendor
+
+By default `AASEnv` drives **Docker** with an NVIDIA GPU. To use **Podman** and/or an **AMD** GPU, pass the corresponding flags (supported by every mode):
+```sh
+python3 -m pip install -e .[podman]                   # Adds the Podman Python client to aas-gym (once)
+systemctl start podman.socket                         # Enable the Docker-compatible API socket (see note below)
+
+python3 gym_run.py --mode step --engine podman                       # Run AAS under Podman
+python3 gym_run.py --mode learn --autopilot ardupilot --gpu-vendor amd   # Pass an AMD GPU (/dev/kfd + /dev/dri) through to the containers
+python3 gym_run.py --mode learn --autopilot ardupilot --engine podman --gpu-vendor amd   # Both
+```
+
+> **Container engines:** `--engine docker` (default) talks to the Docker daemon. `--engine podman` requires the Podman service socket: enable it with `systemctl --user start podman.socket` (rootless) or, recommended for this stack's privileged GPU/X11 containers, `sudo systemctl start podman.socket` as root (`/run/podman/podman.sock`); the Python client auto-detects either, and the socket path can be overridden with `PODMAN_URI`. Podman does not support Docker's `--gpus` device requests: NVIDIA cards are passed through as a [CDI](https://www.mankier.com/5/containers.cdi/) device (`nvidia.com/gpu=all`, which requires running `sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml` once), while AMD GPUs are bound directly via `/dev/kfd` and `/dev/dri` on both engines.
+
+> **GPU vendor:** `--gpu-vendor auto` (default) detects NVIDIA (`/dev/nvidia*`) vs. AMD ROCm (`/dev/kfd`). Set it explicitly to `amd` or `nvidia` when autodetection is wrong (e.g., a headless AMD compute-only node with no `/dev/dri`, or an NVIDIA+AMD hybrid laptop where you want a specific GPU). On SELinux hosts running Podman, `AASEnv` automatically adds `security_opt=label=disable` to the privileged containers so they can access the mounted X11 socket and ZMQ IPC directory.
+
 > **Note:** the observation is the drone's ground-truth pose (with velocity estimated from it) plus the goal offset; actions are normalized `[vE, vN, vUp, yaw_rate]` setpoints. Velocity actuation through MAVROS GUIDED mode is currently wired for `--autopilot ardupilot` only (other autopilots run but actions do not move the drone). Because the RL bridge code lives inside the Docker images (zmq_bridge node, tmux panes, relay script), rebuild the `simulation-image` and `aircraft-image` before using `--mode learn`, or `AASEnv.reset()` will report a payload mismatch.
 
 ## Appendix A: Citation

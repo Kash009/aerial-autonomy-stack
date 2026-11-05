@@ -19,6 +19,10 @@ pyzmq = "^27.1"
 pymavlink = "^2.4"
 pyulog = "^1.2"
 pymap3d = "^3.2"
+podman = { version = "^5.8", optional = true }
+
+[tool.poetry.extras]
+podman = ["podman"]
 
 [tool.poetry.dev-dependencies]
 

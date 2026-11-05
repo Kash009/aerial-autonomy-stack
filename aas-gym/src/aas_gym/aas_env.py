@@ -36,6 +36,8 @@ class AASEnv(gym.Env):
             num_quads: int=1,
             render_mode=None,
             gpu: bool=True,
+            container_engine: str="docker",  # "docker" or "podman" ('pip install podman' + a running podman API socket)
+            gpu_vendor: str="auto",          # GPU passthrough strategy: "auto" (detect), "nvidia" or "amd"
             max_speed: float=7.0,      # [m/s] commanded by an action of 1.0 (planar and vertical)
             max_yaw_rate: float=1.0,   # [rad/s]
             goal_range=(15.0, 45.0),   # [m] min/max distance of the sampled goal from the spawn point
@@ -137,11 +139,30 @@ class AASEnv(gym.Env):
             except subprocess.CalledProcessError as e:
                 print(f"Warning: Could not configure xhost: {e}")
 
-        # Docker setup
+        # Container engine setup (Docker or Podman). Podman is driven through the podman-py client, which mirrors
+        # the Docker SDK API but raises its own exception classes (not subclasses of docker.errors.NotFound/APIError)
+        self.CONTAINER_ENGINE = str(container_engine).strip().lower()
+        if self.CONTAINER_ENGINE not in ("docker", "podman"):
+            raise ValueError(f"Invalid container_engine '{container_engine}': choose 'docker' or 'podman'")
+        self.GPU_VENDOR = str(gpu_vendor).strip().lower()
+        if self.GPU_VENDOR not in ("auto", "nvidia", "amd"):
+            raise ValueError(f"Invalid gpu_vendor '{gpu_vendor}': choose 'auto', 'nvidia' or 'amd'")
         try:
-            self.client = docker.from_env()
-        except Exception as e:
-            raise RuntimeError("Could not connect to the Docker daemon. Ensure Docker is running.") from e
+            if self.CONTAINER_ENGINE == "podman":
+                print("Using container engine: Podman")
+                self.client = self._create_podman_client()
+                import podman.errors as engine_errors
+            else:
+                print("Using container engine: Docker")
+                try:
+                    self.client = docker.from_env()
+                except Exception as e:
+                    raise RuntimeError("Could not connect to the Docker daemon. Ensure Docker is running.") from e
+                engine_errors = docker.errors
+        except ImportError as e: # podman pip package missing, but only if Podman was requested
+            raise RuntimeError("container_engine='podman' requires the Podman Python client: pip install podman") from e
+        self._not_found_exc = (engine_errors.NotFound,) # Engine-appropriate exception classes for the cleanup paths below
+        self._api_error_exc = (engine_errors.APIError,)
         #
         def force_container_cleanup(name): # Needed to use AsyncVectorEnv
             try:
@@ -149,7 +170,7 @@ class AASEnv(gym.Env):
                 print(f"Found existing container '{name}'. Removing it...")
                 old_container.remove(force=True)
                 time.sleep(1.0)
-            except docker.errors.NotFound:
+            except self._not_found_exc:
                 pass
             except Exception as e:
                 print(f"Warning during cleanup of {name}: {e}")
@@ -167,9 +188,9 @@ class AASEnv(gym.Env):
                 existing_network = self.client.networks.get(net_name)
                 existing_network.remove()
                 print(f"Existing network '{net_name}' removed.")
-            except docker.errors.NotFound:
+            except self._not_found_exc:
                 pass
-            except docker.errors.APIError as e:
+            except self._api_error_exc as e:
                 print(f"Warning: Could not remove {net_name}: {e}")
             ipam_pool = docker.types.IPAMPool(
                 subnet=f"{base_ip}.0.0/16",
@@ -188,18 +209,18 @@ class AASEnv(gym.Env):
         #
         env_display = os.environ.get('DISPLAY', '')
         env_xdg = os.environ.get('XDG_RUNTIME_DIR', '')
-        gpu_requests = [
-            DeviceRequest(count=-1, capabilities=[['gpu']]) # Replaces "--gpus all"
-        ] if gpu else []
+        gpu_requests, device_binds, gpu_env = self._gpu_container_config(gpu)
+        # On SELinux hosts (common with Podman), bind-mounting /tmp/.X11-unix and the ZMQ IPC dir into containers
+        # requires disabling label enforcement for these privileged containers
+        extra_container_kwargs = {}
+        if self.CONTAINER_ENGINE == "podman" and os.path.exists("/sys/fs/selinux"):
+            extra_container_kwargs["security_opt"] = ["label=disable"]
         self.ZMQ_IPC_SOCKET_DIR = '/tmp/aas_zmq_sockets'
         os.makedirs(self.ZMQ_IPC_SOCKET_DIR, exist_ok=True)
         volume_binds = {
             '/tmp/.X11-unix': {'bind': '/tmp/.X11-unix', 'mode': 'rw'}, # Replaces "--volume /tmp/.X11-unix:/tmp/.X11-unix:rw"
             self.ZMQ_IPC_SOCKET_DIR: {'bind': self.ZMQ_IPC_SOCKET_DIR, 'mode': 'rw'} # For ZMQ IPC sockets
         }
-        device_binds = [
-            '/dev/dri:/dev/dri:rwm' # Replaces "--device /dev/dri"
-        ] if gpu else []
         #
         force_container_cleanup(self.SIM_CONT_NAME)
         print(f"Creating Simulation Container ({self.SIM_CONT_NAME})...")
@@ -216,9 +237,7 @@ class AASEnv(gym.Env):
             environment={
                 "DISPLAY": env_display,
                 "QT_X11_NO_MITSHM": "1",
-                **({"NVIDIA_DRIVER_CAPABILITIES": "all",
-                    "__NV_PRIME_RENDER_OFFLOAD": "1",
-                    "__GLX_VENDOR_LIBRARY_NAME": "nvidia"} if gpu else {}),
+                **gpu_env,
                 "XDG_RUNTIME_DIR": env_xdg,
                 "GST_DEBUG": "3",
                 "AUTOPILOT": self.AUTOPILOT,
@@ -241,7 +260,8 @@ class AASEnv(gym.Env):
                 "GYM_FREQ_HZ" : str(self.GYM_FREQ_HZ),
                 "GYM_INIT_DURATION" : str(self.GYM_INIT_DURATION),
                 "INSTANCE": str(self.INSTANCE),
-            }
+            },
+            **extra_container_kwargs
         )
         print(f"Connecting {self.SIM_CONT_NAME} to {self.SIM_NET_NAME}...")
         self.networks[self.SIM_NET_NAME].connect(
@@ -278,9 +298,7 @@ class AASEnv(gym.Env):
                 environment={
                     "DISPLAY": env_display,
                     "QT_X11_NO_MITSHM": "1",
-                    **({"NVIDIA_DRIVER_CAPABILITIES": "all",
-                        "__NV_PRIME_RENDER_OFFLOAD": "1",
-                        "__GLX_VENDOR_LIBRARY_NAME": "nvidia"} if gpu else {}),
+                    **gpu_env,
                     "XDG_RUNTIME_DIR": env_xdg,
                     "GST_DEBUG": "3",
                     "AUTOPILOT": self.AUTOPILOT,
@@ -298,7 +316,8 @@ class AASEnv(gym.Env):
                     "GND_CONTAINER": str(self.GND_CONTAINER).lower(),
                     "ROS_DOMAIN_ID": str(drone_id),
                     "GYMNASIUM" : "true",
-                }
+                },
+                **extra_container_kwargs
             )
             print(f"Connecting {air_cont_name} to {self.SIM_NET_NAME}...")
             self.networks[self.SIM_NET_NAME].connect(
@@ -321,6 +340,74 @@ class AASEnv(gym.Env):
         if self.ZMQ_TRANSPORT == "tcp":
             self.ZMQ_PORT = 5555
             self.ZMQ_IP = f"{self.SIM_SUBNET}.90.{self.SIM_ID}"
+
+    @staticmethod
+    def _create_podman_client():
+        # The Podman API socket can be forced with the PODMAN_URI env var (e.g. "http+unix:///run/user/1000/podman/podman.sock"
+        # or a bare socket path); otherwise auto-detected: rootless user socket first, then rootful /run/podman/podman.sock.
+        # Note that rootless Podman cannot expose host GPU/X11 devices to privileged containers; users needing GPUs/GUIs
+        # should run from a root-privileged context with the rootful socket enabled (systemctl start podman.socket)
+        try:
+            from podman import PodmanClient
+        except ImportError as e:
+            raise RuntimeError("container_engine='podman' requires the Podman Python client: pip install podman") from e
+        base_url = os.environ.get("PODMAN_URI") or os.environ.get("PODMAN_HOST")
+        if not base_url:
+            candidates = []
+            getuid = getattr(os, "getuid", None)
+            user_sock = f"/run/user/{getuid()}/podman/podman.sock" if getuid else None
+            if user_sock and os.path.exists(user_sock):
+                candidates.append(user_sock)
+            root_sock = "/run/podman/podman.sock"
+            if os.path.exists(root_sock):
+                candidates.append(root_sock)
+            base_url = candidates[0] if candidates else root_sock
+        if not base_url.startswith(("http://", "https://", "http+unix://", "http+ssh://", "tcp://", "ssh://")):
+            base_url = "http+unix://" + base_url # Accept a bare socket path
+        print(f"Connecting to Podman API at {base_url}...")
+        client = PodmanClient(base_url=base_url)
+        try:
+            if not client.ping():
+                raise ConnectionError("Podman API replied negatively to ping")
+        except Exception as e:
+            raise RuntimeError(
+                f"Could not reach the Podman API at {base_url}. Enable its Docker-compatible socket "
+                "('systemctl --user start podman.socket' for rootless, or 'systemctl start podman.socket' for rootful, "
+                "which is recommended with this stack's privileged GPU/X11 containers), or set PODMAN_URI."
+            ) from e
+        return client
+
+    def _gpu_container_config(self, gpu: bool):
+        # Returns (device_requests, device_binds, extra_environment) for the selected engine and vendor.
+        # NVIDIA-on-Docker uses the DeviceRequest API ('--gpus all'). AMD GPUs cannot use that anywhere and are
+        # passed through as host devices. Podman has no DeviceRequest support at all: NVIDIA cards go through a
+        # CDI device instead (requires 'sudo nvidia-ctk cdi generate' from the NVIDIA Container Toolkit)
+        if not gpu:
+            return [], [], {}
+        vendor = self.GPU_VENDOR
+        if vendor == "auto":
+            if shutil.which("nvidia-smi") or os.path.exists("/dev/nvidia0"):
+                vendor = "nvidia"
+            elif os.path.exists("/dev/kfd"): # The ROCm kernel driver's compute node is AMD-specific
+                vendor = "amd"
+            else:
+                print("Warning: no NVIDIA (/dev/nvidia*) or AMD (/dev/kfd) GPU detected; defaulting to the "
+                      "NVIDIA passthrough path. Pass gpu_vendor='amd' explicitly for an AMD GPU.")
+                vendor = "nvidia"
+        self.RESOLVED_GPU_VENDOR = vendor
+        if vendor == "amd":
+            # /dev/kfd (ROCm compute) + /dev/dri (DRM graphics); privileged containers bypass device ACLs anyway,
+            # binding them explicitly documents intent and also keeps working in less-permissive setups
+            return [], ["/dev/kfd:/dev/kfd:rwm", "/dev/dri:/dev/dri:rwm"], {}
+        if self.CONTAINER_ENGINE == "podman":
+            return [], ["nvidia.com/gpu=all", "/dev/dri:/dev/dri:rwm"], {} # CDI device, see note above
+        device_requests = [
+            DeviceRequest(count=-1, capabilities=[['gpu']]) # Replaces "--gpus all"
+        ]
+        extra_env = {"NVIDIA_DRIVER_CAPABILITIES": "all",
+                     "__NV_PRIME_RENDER_OFFLOAD": "1",
+                     "__GLX_VENDOR_LIBRARY_NAME": "nvidia"}
+        return device_requests, ["/dev/dri:/dev/dri:rwm"], extra_env
 
     @staticmethod
     def _gz_model_names(autopilot: str, num_quads: int) -> list:
