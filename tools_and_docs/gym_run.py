@@ -22,13 +22,13 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", type=str, default="step", choices=["step", "speedup", "vectorenv-speedup", "learn"])
     parser.add_argument("--repetitions", type=int, default=1),
-    parser.add_argument("--autopilot", type=str, default="px4", choices=["px4", "ardupilot"])
+    parser.add_argument("--autopilot", type=str, default="ardupilot", choices=["px4", "ardupilot"])  # RL actuation only exists for ardupilot; px4 trains on random motion
     parser.add_argument("--camera", action=argparse.BooleanOptionalAction, default=True, help="Enable/Disable Camera")
     parser.add_argument("--lidar", action=argparse.BooleanOptionalAction, default=True, help="Enable/Disable Lidar")
     parser.add_argument("--num_quads", type=int, default=1)
     parser.add_argument("--gpu", action=argparse.BooleanOptionalAction, default=True, help="Enable/Disable GPU bindings")
     parser.add_argument("--engine", type=str, default="docker", choices=["docker", "podman"], help="Container engine launching the AAS images (Podman requires 'pip install podman' and a running podman API socket)")
-    parser.add_argument("--gpu-vendor", type=str, default="auto", choices=["auto", "nvidia", "amd"], help="GPU passthrough strategy; auto detects NVIDIA (/dev/nvidia*) vs AMD ROCm (/dev/kfd); AMD is bound via /dev/kfd + /dev/dri on both engines")
+    parser.add_argument("--gpu-vendor", type=str, default="auto", choices=["auto", "nvidia", "amd", "none"], help="GPU passthrough strategy; auto detects NVIDIA (/dev/nvidia*) vs AMD ROCm (/dev/kfd), else none (e.g. AMD under WSL); AMD is bound via /dev/kfd + /dev/dri on both engines")
     # Options specific to --mode learn
     parser.add_argument("--timesteps", type=int, default=200_000, help="Total RL training steps (environment interactions)")
     parser.add_argument("--num-envs", type=int, default=1, help="Parallel AASEnv instances for RL training (instance IDs 0..num_envs-1)")

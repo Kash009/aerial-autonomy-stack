@@ -37,7 +37,7 @@ class AASEnv(gym.Env):
             render_mode=None,
             gpu: bool=True,
             container_engine: str="docker",  # "docker" or "podman" ('pip install podman' + a running podman API socket)
-            gpu_vendor: str="auto",          # GPU passthrough strategy: "auto" (detect), "nvidia" or "amd"
+            gpu_vendor: str="auto",          # GPU passthrough strategy: "auto" (detect; none if no GPU found), "nvidia", "amd" or "none"
             max_speed: float=7.0,      # [m/s] commanded by an action of 1.0 (planar and vertical)
             max_yaw_rate: float=1.0,   # [rad/s]
             goal_range=(15.0, 45.0),   # [m] min/max distance of the sampled goal from the spawn point
@@ -145,8 +145,8 @@ class AASEnv(gym.Env):
         if self.CONTAINER_ENGINE not in ("docker", "podman"):
             raise ValueError(f"Invalid container_engine '{container_engine}': choose 'docker' or 'podman'")
         self.GPU_VENDOR = str(gpu_vendor).strip().lower()
-        if self.GPU_VENDOR not in ("auto", "nvidia", "amd"):
-            raise ValueError(f"Invalid gpu_vendor '{gpu_vendor}': choose 'auto', 'nvidia' or 'amd'")
+        if self.GPU_VENDOR not in ("auto", "nvidia", "amd", "none"):
+            raise ValueError(f"Invalid gpu_vendor '{gpu_vendor}': choose 'auto', 'nvidia', 'amd' or 'none'")
         try:
             if self.CONTAINER_ENGINE == "podman":
                 print("Using container engine: Podman")
@@ -381,21 +381,26 @@ class AASEnv(gym.Env):
         # Returns (device_requests, device_binds, extra_environment) for the selected engine and vendor.
         # NVIDIA-on-Docker uses the DeviceRequest API ('--gpus all'). AMD GPUs cannot use that anywhere and are
         # passed through as host devices. Podman has no DeviceRequest support at all: NVIDIA cards go through a
-        # CDI device instead (requires 'sudo nvidia-ctk cdi generate' from the NVIDIA Container Toolkit)
-        if not gpu:
+        # CDI device instead (requires 'sudo nvidia-ctk cdi generate' from the NVIDIA Container Toolkit).
+        # When no usable GPU is found (or for AMD under WSL) nothing is passed through and Gazebo uses software GL.
+        if not gpu or self.GPU_VENDOR == "none":
             return [], [], {}
         vendor = self.GPU_VENDOR
         if vendor == "auto":
-            if shutil.which("nvidia-smi") or os.path.exists("/dev/nvidia0"):
+            if self._nvidia_available():
                 vendor = "nvidia"
             elif os.path.exists("/dev/kfd"): # The ROCm kernel driver's compute node is AMD-specific
                 vendor = "amd"
             else:
-                print("Warning: no NVIDIA (/dev/nvidia*) or AMD (/dev/kfd) GPU detected; defaulting to the "
-                      "NVIDIA passthrough path. Pass gpu_vendor='amd' explicitly for an AMD GPU.")
-                vendor = "nvidia"
+                print("Warning: no NVIDIA (/dev/nvidia*) or AMD (/dev/kfd) GPU detected; running without GPU "
+                      "passthrough (Gazebo falls back to software GL). Pass gpu_vendor='nvidia' or 'amd' to force.")
+                return [], [], {}
         self.RESOLVED_GPU_VENDOR = vendor
         if vendor == "amd":
+            if self._is_wsl():
+                # WSL has no /dev/kfd, so AMD GPUs cannot be passed through to containers under WSL
+                print("Warning: running under WSL where /dev/kfd does not exist; skipping AMD GPU passthrough.")
+                return [], [], {}
             # /dev/kfd (ROCm compute) + /dev/dri (DRM graphics); privileged containers bypass device ACLs anyway,
             # binding them explicitly documents intent and also keeps working in less-permissive setups
             return [], ["/dev/kfd:/dev/kfd:rwm", "/dev/dri:/dev/dri:rwm"], {}
@@ -408,6 +413,34 @@ class AASEnv(gym.Env):
                      "__NV_PRIME_RENDER_OFFLOAD": "1",
                      "__GLX_VENDOR_LIBRARY_NAME": "nvidia"}
         return device_requests, ["/dev/dri:/dev/dri:rwm"], extra_env
+
+    @staticmethod
+    def _is_wsl():
+        # WSL2 kernel releases look like "5.15.x-microsoft-standard-WSL2"; fall back to /proc/version
+        try:
+            release = os.uname().release.lower()
+            return "microsoft" in release or "wsl" in release
+        except AttributeError:
+            pass
+        try:
+            with open("/proc/version", "r") as f:
+                return "microsoft" in f.read().lower()
+        except OSError:
+            return False
+
+    @staticmethod
+    def _nvidia_available():
+        # A usable NVIDIA stack needs device nodes or a working 'nvidia-smi -L'; the binary alone can be present
+        # from an installed-but-broken WSL driver (e.g. NVML fails to initialize with no /dev/nvidia* nodes)
+        if os.path.exists("/dev/nvidia0"):
+            return True
+        if not shutil.which("nvidia-smi"):
+            return False
+        try:
+            out = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True, timeout=10)
+            return out.returncode == 0 and bool(out.stdout.strip())
+        except (OSError, subprocess.SubprocessError):
+            return False
 
     @staticmethod
     def _gz_model_names(autopilot: str, num_quads: int) -> list:
