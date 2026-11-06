@@ -17,6 +17,7 @@ gym.register(
     entry_point=AASEnv,
 )
 
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", type=str, default="step", choices=["step", "speedup", "vectorenv-speedup", "learn"])
@@ -161,7 +162,8 @@ def main():
     elif args.mode == "learn":
         from stable_baselines3 import PPO
         from stable_baselines3.common.monitor import Monitor
-        from stable_baselines3.common.vec_env import AsyncVectorEnv, DummyVecEnv
+        # stable-baselines3 >= 2 removed AsyncVectorEnv; DummyVecEnv (serial) and SubprocVecEnv (multiprocess) remain
+        from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
         if args.check_env:
             from stable_baselines3.common.env_checker import check_env as sb3_check_env
 
@@ -169,25 +171,27 @@ def main():
             print("WARNING: RL actuation (velocity setpoints through MAVROS GUIDED mode) is only implemented for --autopilot ardupilot.")
 
         def make_env(rank):
-            # Every AASEnv instance boots its own set of Docker containers on a unique subnet
-            env = gym.make(
-                "AASEnv-v0",
-                instance=rank,
-                gym_freq_hz=50,
-                autopilot=args.autopilot,
-                camera=args.camera,
-                lidar=args.lidar,
-                num_quads=args.num_quads,
-                render_mode=None,
-                gpu=args.gpu,
-                container_engine=args.engine,
-                gpu_vendor=args.gpu_vendor
-            )
-            return Monitor(env) # Adds episode/step/return logging usable by PPO callbacks
+            # Callable for the vector env; every AASEnv instance boots its own set of Docker containers on a unique subnet
+            def _init():
+                env = gym.make(
+                    "AASEnv-v0",
+                    instance=rank,
+                    gym_freq_hz=50,
+                    autopilot=args.autopilot,
+                    camera=args.camera,
+                    lidar=args.lidar,
+                    num_quads=args.num_quads,
+                    render_mode=None,
+                    gpu=args.gpu,
+                    container_engine=args.engine,
+                    gpu_vendor=args.gpu_vendor
+                )
+                return Monitor(env) # Adds episode/step/return logging usable by PPO callbacks
+            return _init
 
         if args.num_envs > 1:
             print(f"Creating {args.num_envs} AASEnv instances (Docker containers for instances 0..{args.num_envs - 1})...")
-            venv = AsyncVectorEnv([make_env(rank) for rank in range(args.num_envs)])
+            venv = SubprocVecEnv([make_env(rank) for rank in range(args.num_envs)])
         else:
             venv = DummyVecEnv([make_env(0)])
 
