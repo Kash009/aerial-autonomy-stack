@@ -1,11 +1,11 @@
 ArduPilotPlugin: do not deadlock lock-step before the first state
-From https://github.com/ArduPilot/ardupilot_gazebo/pull/183 (commit 74c3ace by dougamann), drop once merged upstream
+From https://github.com/ArduPilot/ardupilot_gazebo/pull/183 (commit 74c3ace by dougamann), rebased onto f116b03, drop once merged upstream
 
 diff --git a/src/ArduPilotPlugin.cc b/src/ArduPilotPlugin.cc
-index 8309c37..7fbb167 100755
+index 0246604..c1f8517 100755
 --- a/src/ArduPilotPlugin.cc
 +++ b/src/ArduPilotPlugin.cc
-@@ -1203,8 +1203,17 @@ void gz::sim::systems::ArduPilotPlugin::PreUpdate(
+@@ -1208,8 +1208,17 @@ void gz::sim::systems::ArduPilotPlugin::PreUpdate(
          {
              if (this->dataPtr->isLockStep)
              {
@@ -24,7 +24,7 @@ index 8309c37..7fbb167 100755
                  {
                      // SIGNINT should interrupt this loop.
                      if (this->dataPtr->signal != 0)
-@@ -2025,6 +2034,12 @@ void gz::sim::systems::ArduPilotPlugin::CreateStateJSON(
+@@ -2035,6 +2044,12 @@ void gz::sim::systems::ArduPilotPlugin::CreateStateJSON(
  /////////////////////////////////////////////////
  void gz::sim::systems::ArduPilotPlugin::SendState() const
  {
