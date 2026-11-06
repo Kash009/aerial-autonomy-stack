@@ -493,11 +493,14 @@ class AASEnv(gym.Env):
         self.prev_sim_time = sim_time
 
     def _sample_goal(self):
-        # Random goal on an annulus around the spawn point, at roughly the current altitude
-        radius = self._np_random.uniform(*self.goal_range)
-        bearing = self._np_random.uniform(0.0, 2.0 * np.pi)
+        # Random goal on an annulus around the spawn point, at roughly the current altitude.
+        # Use the np_random property (not the _np_random attribute): Env.reset only sets it when an
+        # explicit seed is passed; the property lazily creates an unseeded RNG otherwise
+        rng = self.np_random
+        radius = rng.uniform(*self.goal_range)
+        bearing = rng.uniform(0.0, 2.0 * np.pi)
         z_start = float(self.pos_all[0][2])
-        z_goal = min(max(z_start + self._np_random.uniform(-3.0, 3.0), 2.0), 80.0)
+        z_goal = min(max(z_start + rng.uniform(-3.0, 3.0), 2.0), 80.0)
         self.goal = self.spawn_xy + radius * np.array([np.cos(bearing), np.sin(bearing)], dtype=np.float64)
         self.goal = np.array([self.goal[0], self.goal[1], z_goal], dtype=np.float64)
 
