@@ -1,0 +1,4 @@
+# Everything in this repo is baked into Linux containers. A Windows checkout with
+# core.autocrlf=true otherwise produces CRLF copies of the patches (breaking `git apply`
+# in the image builds) and of the scripts executed at SITL startup (`$'\r'` errors).
+* text=auto eol=lf
