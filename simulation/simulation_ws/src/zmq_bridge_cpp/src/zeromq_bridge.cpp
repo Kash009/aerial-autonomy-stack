@@ -201,7 +201,7 @@ private:
     void subscribe_poses(const std::string& world_name) {
         if (gym_model_names_.empty()) return;
         std::string pose_topic = "/world/" + world_name + "/dynamic_pose/info";
-        bool ok = gz_node_.Subscribe(pose_topic, 10, &ZMQBridge::pose_callback, this);
+        bool ok = gz_node_.Subscribe(pose_topic, &ZMQBridge::pose_callback, this); // default options (gz-transport v13 dropped the queue-depth int overload)
         if (ok) {
             RCLCPP_INFO(this->get_logger(), "Subscribed to ground-truth poses on %s", pose_topic.c_str());
         } else {
