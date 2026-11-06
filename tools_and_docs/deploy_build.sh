@@ -94,7 +94,8 @@ for repo_info in "${REPOS[@]}"; do
     TEMP_DIR="${TARGET_DIR}_temp"
     rm -rf "$TEMP_DIR" # Clean up any failed clone from a previous run
     for attempt in 1 2 3; do # Up to 3 tries
-      git clone --depth 1 --shallow-submodules --branch "$branch" --recursive "$url" "$TEMP_DIR" && break
+      # core.autocrlf=false: the sources are built inside Linux containers, where CRLF worktrees break `git apply` and shell scripts
+      git -c core.autocrlf=false clone --depth 1 --shallow-submodules --branch "$branch" --recursive "$url" "$TEMP_DIR" && break
       echo "Clone of ${dir} failed (attempt ${attempt}/3), retrying..."
       rm -rf "$TEMP_DIR"
       sleep 2
