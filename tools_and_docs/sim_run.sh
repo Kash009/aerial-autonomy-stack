@@ -31,7 +31,7 @@ INSTANCE="${INSTANCE:-0}" # Integer ID to make docker network/container names un
 # Note: the analysis/plotting env variable is used by this script on cleanup and NOT passed to any container
 PLOT="${PLOT:-false}" # Options: true, false (default)
 CONTAINER_ENGINE="${CONTAINER_ENGINE:-auto}" # Options: auto (use docker if installed, else podman), docker, podman
-GPU_VENDOR="${GPU_VENDOR:-auto}" # Options: auto (nvidia if detected, else amd when /dev/kfd is present), nvidia, amd
+GPU_VENDOR="${GPU_VENDOR:-auto}" # Options: auto (detect nvidia/amd, none if no GPU found), nvidia, amd, none
 
 # Detect the environment (Ubuntu/GNOME, WSL, etc.)
 if echo "$XDG_CURRENT_DESKTOP" | grep -qi "gnome"; then
@@ -59,7 +59,7 @@ for v in SIM_ID GROUND_ID; do check_int "$v" 100 101; done
 check_int INSTANCE 0 99
 check_num RTF
 check_enum CONTAINER_ENGINE auto docker podman
-check_enum GPU_VENDOR auto nvidia amd
+check_enum GPU_VENDOR auto nvidia amd none
 if [[ "$PX4_ROS2_LIB" == "true" && "$RTF" != "1.0" ]]; then echo "WARNING: PX4_ROS2_LIB=true sets RTF=1.0 (was RTF=$RTF)" >&2; RTF=1.0; fi
 if [[ "$AUTOPILOT" == "betaflight" && "$RTF" != "1.0" ]]; then echo "WARNING: AUTOPILOT=betaflight sets RTF=1.0 (was RTF=$RTF)" >&2; RTF=1.0; fi
 print_envvars
@@ -78,27 +78,39 @@ elif ! command -v "$CONTAINER_ENGINE" >/dev/null 2>&1; then
 fi
 export CONTAINER_ENGINE
 
-# Resolve the GPU vendor on this Linux host (WSL only exposes NVIDIA ROCm-free paths, so AMD assumes a native Linux host)
+# Resolve the GPU vendor. Under WSL only NVIDIA is usable from containers (via Docker Desktop);
+# AMD GPUs have no /dev/kfd there, so they require a native Linux host.
 if [[ "$GPU_VENDOR" == "auto" ]]; then
-  if command -v nvidia-smi >/dev/null 2>&1 || [[ -e /dev/nvidia0 ]]; then
+  if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
     GPU_VENDOR=nvidia
   elif [[ -e /dev/kfd ]]; then
     GPU_VENDOR=amd
   else
-    echo "WARNING: could not detect a discrete GPU, assuming nvidia" >&2
-    GPU_VENDOR=nvidia
+    GPU_VENDOR=none
+    echo "WARNING: no discrete GPU detected (no working nvidia-smi, no /dev/kfd); running without GPU passthrough" >&2
+    echo "         (Gazebo falls back to software GL in the container; set GPU_VENDOR=nvidia|amd to force)" >&2
   fi
+fi
+if [[ "$GPU_VENDOR" == "nvidia" ]] && ! command -v nvidia-smi >/dev/null 2>&1; then
+  abort "GPU_VENDOR=nvidia but nvidia-smi not found (NVIDIA driver not installed?)"
+fi
+if [[ "$GPU_VENDOR" == "amd" && "$DESK_ENV" != "wsl" ]] && ! [[ -e /dev/kfd ]]; then
+  abort "GPU_VENDOR=amd but /dev/kfd not found (AMD GPU driver not loaded?)"
 fi
 export GPU_VENDOR
 echo "Container engine: $CONTAINER_ENGINE | GPU vendor: $GPU_VENDOR"
 
 # Per-engine + per-vendor device flags, driver env vars, and SELinux labeling options.
 # NOTE: podman + NVIDIA requires a CDI spec once (needs root): sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
-if [[ "$CONTAINER_ENGINE" == "podman" ]]; then
+if [[ "$GPU_VENDOR" == "amd" && "$DESK_ENV" == "wsl" ]]; then
+  GPU_DEVICE_OPTS="" # WSL has no /dev/kfd, so AMD GPUs cannot be passed through to containers under WSL
+elif [[ "$CONTAINER_ENGINE" == "podman" ]]; then
   if [[ "$GPU_VENDOR" == "amd" ]]; then
     GPU_DEVICE_OPTS="--device /dev/dri --device /dev/kfd"
-  else
+  elif [[ "$GPU_VENDOR" == "nvidia" ]]; then
     GPU_DEVICE_OPTS="--device nvidia.com/gpu=all --device /dev/dri"
+  else
+    GPU_DEVICE_OPTS=""
   fi
   # Containers bind-mount host devices and shm; disable SELinux labeling when it is active on the host
   if [[ -d /sys/fs/selinux ]]; then
@@ -113,8 +125,10 @@ if [[ "$CONTAINER_ENGINE" == "podman" ]]; then
 else
   if [[ "$GPU_VENDOR" == "amd" ]]; then
     GPU_DEVICE_OPTS="--device /dev/dri --device /dev/kfd"
-  else
+  elif [[ "$GPU_VENDOR" == "nvidia" ]]; then
     GPU_DEVICE_OPTS="--device /dev/dri --gpus all"
+  else
+    GPU_DEVICE_OPTS=""
   fi
   SELINUX_OPTS=""
 fi
@@ -165,9 +179,14 @@ if command -v xhost >/dev/null 2>&1; then
   xhost +local:docker
 fi
 
-# WSL-specific options
+# WSL-specific options; force a specific D3D12 adapter only when the vendor is NVIDIA, otherwise Mesa picks automatically
+if [[ "$GPU_VENDOR" == "nvidia" ]]; then
+  MESA_ADAPTER_OPT="--env MESA_D3D12_DEFAULT_ADAPTER_NAME=NVIDIA"
+else
+  MESA_ADAPTER_OPT=""
+fi
 WSL_OPTS="--env WAYLAND_DISPLAY=$WAYLAND_DISPLAY --env PULSE_SERVER=$PULSE_SERVER --volume /usr/lib/wsl:/usr/lib/wsl \
---env MESA_D3D12_DEFAULT_ADAPTER_NAME=NVIDIA --env LD_LIBRARY_PATH=/usr/lib/wsl/lib --env LIBGL_ALWAYS_SOFTWARE=0"
+${MESA_ADAPTER_OPT} --env LD_LIBRARY_PATH=/usr/lib/wsl/lib --env LIBGL_ALWAYS_SOFTWARE=0"
 
 # Get display dimensions
 resolution=$(xrandr 2>/dev/null | grep " connected primary" | grep -oE '[0-9]+x[0-9]+' | head -1)

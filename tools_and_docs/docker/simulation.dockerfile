@@ -16,10 +16,13 @@ RUN apt update \
     && curl https://packages.osrfoundation.org/gazebo.gpg --output /usr/share/keyrings/pkgs-osrf-archive-keyring.gpg \
     && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/pkgs-osrf-archive-keyring.gpg] http://packages.osrfoundation.org/gazebo/ubuntu-stable $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/gazebo-stable.list > /dev/null \
     && apt update \
+    # Mesa gives Gazebo an in-container GL driver when no vendor GPU is injected (--no-install-recommends skips it otherwise):
+    # llvmpipe software rendering, AMD radeonsi via /dev/dri+/dev/kfd, and WSL2 D3D12 interop
     && apt install -y --no-install-recommends \
         gz-harmonic ros-jazzy-ros-gz-bridge \
         libgz-transport13-* libgz-msgs10-dev \
         python3-gz-transport13 python3-gz-msgs10 \
+        mesa-dri-drivers libegl-mesa0 libglx-mesa0 \
     && apt clean \
     && rm -rf /var/lib/apt/lists/*
 # Keep OSRF's gz sim visible after sourcing ROS (gz_tools_vendor replaces the default config path)
