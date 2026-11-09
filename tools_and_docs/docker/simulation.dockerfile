@@ -22,7 +22,7 @@ RUN apt update \
         gz-harmonic ros-jazzy-ros-gz-bridge \
         libgz-transport13-* libgz-msgs10-dev \
         python3-gz-transport13 python3-gz-msgs10 \
-        mesa-dri-drivers libegl-mesa0 libglx-mesa0 \
+        libgl1-mesa-dri libegl-mesa0 libglx-mesa0 \
     && apt clean \
     && rm -rf /var/lib/apt/lists/*
 # Keep OSRF's gz sim visible after sourcing ROS (gz_tools_vendor replaces the default config path)
