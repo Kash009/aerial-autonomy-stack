@@ -38,3 +38,4 @@
       - waypoint          # For mission manipulation
       - rc_io             # For RC override
       - vfr_hud           # For airspeed and altitude info
+      - altitude          # Home-relative altitude above_home, used by gymnasium_setup.py's VTOL MC-hold takeoff check

@@ -55,10 +55,10 @@
     idx = autopilot == 'px4' ? sitl_instance : sitl_instance + 1
     "#{base_models[d[:type]]}_#{idx}"
   end
-  # The RL action relay only drives the first quad (single-agent environment), through its MAVROS node;
+  # The RL action relay only drives the first drone (single-agent environment), through its MAVROS node;
   # it is bound to UDP port 5870 + drone_id in that aircraft container (see rl_guided_relay.py)
   gym_udp_target = ''
-  if autopilot == 'ardupilot' && num_quads > 0
+  if autopilot == 'ardupilot' && num_drones > 0
     gym_udp_target = "#{sim_subnet}.90.1:5871"
   end
 

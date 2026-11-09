@@ -8,7 +8,8 @@ container's own IP, and feeds them to the SITL through MAVROS as ENU velocity se
 (/mavros/setpoint_velocity/cmd_vel), switching the vehicle into GUIDED mode.
 
 Safety behavior:
-- No action for ACTION_TIMEOUT_SEC while active -> publish zero velocity (hover) and switch back to LOITER.
+- No action for ACTION_TIMEOUT_SEC while active -> publish zero velocity (hover) and switch back to the
+  vehicle's hover/loiter mode (LOITER for quads, QLOITER for VTOLs so no FW transition is triggered).
 - Actions resume -> re-enter GUIDED mode automatically.
 
 Run as (one instance per drone, inside the aircraft container; see aircraft.yml.erb):
@@ -29,9 +30,13 @@ from mavros_msgs.srv import SetMode
 
 
 class RLGuidedRelay(Node):
-    def __init__(self, bind_ip: str, bind_port: int, action_timeout_sec: float = 3.0):
+    def __init__(self, bind_ip: str, bind_port: int, action_timeout_sec: float = 3.0, vehicle_type: str = 'quad'):
         super().__init__('rl_guided_relay')
 
+        self.vehicle_type = vehicle_type
+        # On a VTOL, LOITER is the fixed-wing loiter mode (entering it mid-hold can trigger a transition);
+        # QLOITER keeps the vehicle circling/hovering in its multirotor phase instead
+        self.FALLBACK_MODE = 'QLOITER' if vehicle_type == 'vtol' else 'LOITER'
         self.ACTION_TIMEOUT_SEC = action_timeout_sec
         self.MODE_RETRY_SEC = 2.0 # Retry interval for the GUIDED/LOITER mode requests while in each state
 
@@ -125,12 +130,12 @@ class RLGuidedRelay(Node):
             self.publish_twist(vE, vN, vUp, yaw_rate)
 
         if self.relaying and self.last_setpoint_time is not None and now - self.last_setpoint_time > self.ACTION_TIMEOUT_SEC:
-            self.get_logger().warn("Gym action stream stalled, hovering then handing over to LOITER.")
-            # Hover in place for one timeout period before returning control to the autopilot's LOITER
+            self.get_logger().warn(f"Gym action stream stalled, hovering then handing over to {self.FALLBACK_MODE}.")
+            # Hover in place for one timeout period before returning control to the autopilot's hover/loiter mode
             self.publish_twist(0.0, 0.0, 0.0, 0.0)
             if now - self.last_setpoint_time > 2.0 * self.ACTION_TIMEOUT_SEC:
-                self.request_mode('LOITER')
-                if self.current_state.mode == 'LOITER':
+                self.request_mode(self.FALLBACK_MODE)
+                if self.current_state.mode == self.FALLBACK_MODE:
                     self.relaying = False
 
     def close(self):
@@ -141,7 +146,9 @@ def main():
     parser = argparse.ArgumentParser(description='Gymnasium RL action relay (ArduPilot/MAVLink->MAVROS)')
     parser.add_argument('--drone-id', type=int, required=True, help='Drone ID; binds UDP port 5870 + drone_id on all interfaces')
     parser.add_argument('--bind-ip', type=str, default='0.0.0.0', help='UDP bind address (default: all interfaces)')
-    parser.add_argument('--action-timeout-sec', type=float, default=3.0, help='Wall seconds of missing actions before reverting to LOITER')
+    parser.add_argument('--action-timeout-sec', type=float, default=3.0, help='Wall seconds of missing actions before reverting to the vehicle hover/loiter mode')
+    parser.add_argument('--vehicle-type', type=str, choices=['quad', 'vtol', 'tail'], default='quad',
+                        help='Drone type; VTOL falls back to QLOITER (MC hover) instead of LOITER (FW loiter) when the action stream stalls')
     parsed_args, ros_args = parser.parse_known_args()
 
     if not 1 <= parsed_args.drone_id <= 9:
@@ -150,7 +157,7 @@ def main():
     bind_port = 5870 + parsed_args.drone_id
 
     rclpy.init(args=ros_args) # Passes through ROS arguments such as -p use_sim_time:=true
-    node = RLGuidedRelay(parsed_args.bind_ip, bind_port, parsed_args.action_timeout_sec)
+    node = RLGuidedRelay(parsed_args.bind_ip, bind_port, parsed_args.action_timeout_sec, parsed_args.vehicle_type)
     try:
         while rclpy.ok():
             node.spin_once(timeout_sec=0.02) # 50 Hz loop ceiling, aligned with AASEnv.GYM_FREQ_HZ defaults

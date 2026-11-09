@@ -26,7 +26,9 @@ def main():
     parser.add_argument("--autopilot", type=str, default="ardupilot", choices=["px4", "ardupilot"])  # RL actuation only exists for ardupilot; px4 trains on random motion
     parser.add_argument("--camera", action=argparse.BooleanOptionalAction, default=True, help="Enable/Disable Camera")
     parser.add_argument("--lidar", action=argparse.BooleanOptionalAction, default=True, help="Enable/Disable Lidar")
-    parser.add_argument("--num_quads", type=int, default=1)
+    parser.add_argument("--num_quads", type=int, default=0, help="Number of quadcopters (VTOLs are the default vehicle type)")
+    parser.add_argument("--num_vtols", type=int, default=1, help="Number of VTOLs (ArduPilot: alti_transition_quad, PX4: standard_vtol)")
+    parser.add_argument("--num_tails", type=int, default=0, help="Number of tailsitters")
     parser.add_argument("--gpu", action=argparse.BooleanOptionalAction, default=True, help="Enable/Disable GPU bindings")
     parser.add_argument("--engine", type=str, default="docker", choices=["docker", "podman"], help="Container engine launching the AAS images (Podman requires 'pip install podman' and a running podman API socket)")
     parser.add_argument("--gpu-vendor", type=str, default="auto", choices=["auto", "nvidia", "amd", "none"], help="GPU passthrough strategy; auto detects NVIDIA (/dev/nvidia*) vs AMD ROCm (/dev/kfd), else none (e.g. AMD under WSL); AMD is bound via /dev/kfd + /dev/dri on both engines")
@@ -43,6 +45,9 @@ def main():
     parser.add_argument("--instance", type=int, default=0, help="AASEnv instance ID for eval mode (its own Docker subnet/containers)")
     args = parser.parse_args()
 
+    if args.num_quads + args.num_vtols + args.num_tails < 1:
+        parser.error("At least one drone is required: pass --num_quads, --num_vtols and/or --num_tails")
+
     if args.mode == "step":
         env = gym.make(
             "AASEnv-v0",
@@ -51,6 +56,8 @@ def main():
             camera=args.camera,
             lidar=args.lidar,
             num_quads=args.num_quads,
+            num_vtols=args.num_vtols,
+            num_tails=args.num_tails,
             render_mode="human",
             gpu=args.gpu,
             container_engine=args.engine,
@@ -84,6 +91,8 @@ def main():
             camera=args.camera,
             lidar=args.lidar,
             num_quads=args.num_quads,
+            num_vtols=args.num_vtols,
+            num_tails=args.num_tails,
             render_mode="ansi", # "ansi" for progress bar, "human" for GUI
             gpu=args.gpu,
             container_engine=args.engine,
@@ -134,6 +143,8 @@ def main():
                     camera=args.camera,
                     lidar=args.lidar,
                     num_quads=args.num_quads,
+                    num_vtols=args.num_vtols,
+                    num_tails=args.num_tails,
                     render_mode=None,
                     gpu=args.gpu,
                     container_engine=args.engine,
@@ -187,6 +198,8 @@ def main():
                     camera=args.camera,
                     lidar=args.lidar,
                     num_quads=args.num_quads,
+                    num_vtols=args.num_vtols,
+                    num_tails=args.num_tails,
                     render_mode=None,
                     gpu=args.gpu,
                     container_engine=args.engine,
@@ -280,6 +293,8 @@ def main():
             camera=args.camera,
             lidar=args.lidar,
             num_quads=args.num_quads,
+            num_vtols=args.num_vtols,
+            num_tails=args.num_tails,
             render_mode="human",
             gpu=args.gpu,
             container_engine=args.engine,

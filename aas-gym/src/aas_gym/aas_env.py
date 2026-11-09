@@ -33,7 +33,9 @@ class AASEnv(gym.Env):
             camera: bool=True,
             lidar: bool=True,
             odom: str="none",
-            num_quads: int=1,
+            num_quads: int=0,
+            num_vtols: int=1,  # VTOLs are the default vehicle type
+            num_tails: int=0,
             render_mode=None,
             gpu: bool=True,
             container_engine: str="docker",  # "docker" or "podman" ('pip install podman' + a running podman API socket)
@@ -49,13 +51,15 @@ class AASEnv(gym.Env):
         self.GYM_INIT_DURATION = 80.0  # Seconds to run unpaused during reset (seconds)
         self.MAX_EPISODE_LENGTH_SEC = 300.0  # Max episode length in seconds (excluding init duration)
 
-        self.NUM_DRONES = int(num_quads)  # Keep in sync with the (currently zero) NUM_VTOLS/NUM_TAILS below
+        self.NUM_DRONES = int(num_quads) + int(num_vtols) + int(num_tails)
         self.max_speed = float(max_speed)
         self.max_yaw_rate = float(max_yaw_rate)
         self.goal_range = goal_range
         self.bounds_radius_m = float(bounds_radius_m)
+        # Spawn order matches simulation/simulation.yml.erb (all quads, then VTOLs, then tails); the RL env is single-agent on the first drone
+        self.drone_types = (["quad"] * int(num_quads) + ["vtol"] * int(num_vtols) + ["tail"] * int(num_tails))
 
-        # Action Space: normalized [vE, vN, vUp (m/s), yaw rate (rad/s)] command for the first quad,
+        # Action Space: normalized [vE, vN, vUp (m/s), yaw rate (rad/s)] command for the first drone,
         # scaled by max_speed / max_yaw_rate and flown by MAVROS in GUIDED mode (AUTOPILOT=ardupilot only)
         self.action_space = gym.spaces.Box(
             low=-1.0,
@@ -74,7 +78,7 @@ class AASEnv(gym.Env):
         # Initialize storage for the clock and RL state
         self.sim_sec = 0.0
         self.sim_nanosec = 0.0
-        self.gz_model_names = self._gz_model_names(autopilot, num_quads)
+        self.gz_model_names = self._gz_model_names(autopilot, self.drone_types)
         if len(self.gz_model_names) == 0:
             raise ValueError("AASEnv requires at least one drone")
         self.reply_fmt = '<iI' + 'd' * (7 * len(self.gz_model_names))
@@ -104,9 +108,9 @@ class AASEnv(gym.Env):
         self.CAMERA = camera
         self.LIDAR = lidar
         self.ODOM = odom
-        self.NUM_QUADS = num_quads
-        self.NUM_VTOLS = 0 # TODO add support beyond multicopters
-        self.NUM_TAILS = 0 # TODO add support beyond multicopters
+        self.NUM_QUADS = int(num_quads)
+        self.NUM_VTOLS = int(num_vtols)
+        self.NUM_TAILS = int(num_tails)
         self.WORLD = "impalpable_greyness"
         #
         self.SIM_SUBNET = "10.42"
@@ -276,11 +280,6 @@ class AASEnv(gym.Env):
         # )
         # self.simulation_container.start()
         #
-        self.drone_types = (
-            ["quad"] * self.NUM_QUADS +
-            ["vtol"] * self.NUM_VTOLS +
-            ["tail"] * self.NUM_TAILS
-        )
         self.aircraft_containers = []
         for drone_id, drone_type in enumerate(self.drone_types, start=1):
             air_cont_name = f"aircraft-container-inst{self.INSTANCE}_{drone_id}"
@@ -444,14 +443,16 @@ class AASEnv(gym.Env):
             return False
 
     @staticmethod
-    def _gz_model_names(autopilot: str, num_quads: int) -> list:
+    def _gz_model_names(autopilot: str, drone_types: list) -> list:
         # Must mirror the model naming of simulation/simulation.yml.erb (gym_models there):
-        # PX4 indexes models by 0-based instance, ArduPilot/Betaflight by 1-based drone_id
-        bases = {"px4": "x500", "ardupilot": "iris_with_ardupilot", "betaflight": "iris_with_betaflight"}
+        # same per-autopilot base models, PX4 indexes by 0-based instance, ArduPilot/Betaflight by 1-based drone_id
+        bases = {"px4": {"quad": "x500", "vtol": "standard_vtol", "tail": "quadtailsitter"},
+                 "ardupilot": {"quad": "iris_with_ardupilot", "vtol": "alti_transition_quad", "tail": "swan_k1_hwing"},
+                 "betaflight": {"quad": "iris_with_betaflight"}}
         if autopilot not in bases:
             raise ValueError(f"No Gazebo model name mapping for autopilot '{autopilot}'")
         idx_offset = 0 if autopilot == "px4" else 1
-        return [f"{bases[autopilot]}_{i + idx_offset}" for i in range(num_quads)]
+        return [f"{bases[autopilot][drone_type]}_{i + idx_offset}" for i, drone_type in enumerate(drone_types)]
 
     def _unpack_reply(self, reply_bytes):
         # Clock (int32 sec, uint32 nanosec) followed by each configured model's ground-truth pose
