@@ -88,6 +88,7 @@ class AASEnv(gym.Env):
 
         self.max_steps = int(self.MAX_EPISODE_LENGTH_SEC*self.GYM_FREQ_HZ)  # Max steps per episode
         self.step_count = 0
+        self.last_event = None  # How the last episode ended: success, crash, soft_land, out_of_bounds or timeout
         
         # Rendering
         self.render_mode = render_mode
@@ -596,6 +597,7 @@ class AASEnv(gym.Env):
         self.spawn_xy = self.pos_all[0][:2].copy()
         self._sample_goal()
         self.step_count = 0
+        self.last_event = None
         
         if self.render_mode == "ansi":
             self._render_frame()
@@ -648,19 +650,24 @@ class AASEnv(gym.Env):
         if d_cur_2d <= self.GOAL_RADIUS_M and abs(float(self.goal[2] - own_pos[2])) <= self.GOAL_ALT_TOL_M:
             reward += self.SUCCESS_REWARD
             terminated = True
+            self.last_event = "success"
         # Crash or landing on the ground: faster contact costs more than a soft touchdown
         elif own_pos[2] <= self.CRASH_AGL_M:
             speed = float(np.linalg.norm(self.vel_est))
+            self.last_event = "crash" if speed > 3.0 else "soft_land"
             reward += self.CRASH_REWARD if speed > 3.0 else self.SOFT_LAND_REWARD
             terminated = True
         # Out-of-bounds flyaway
         elif float(np.linalg.norm(own_pos[:2] - self.spawn_xy)) >= self.bounds_radius_m:
             reward += self.OUT_OF_BOUNDS_REWARD
             terminated = True
+            self.last_event = "out_of_bounds"
 
         self.step_count += 1
         # Check for truncation (episode ends due to time limit)
         truncated = self.step_count >= self.max_steps
+        if not terminated and truncated:
+            self.last_event = "timeout"
         # Get obs and info
         obs = self._get_obs()
         info = self._get_info()

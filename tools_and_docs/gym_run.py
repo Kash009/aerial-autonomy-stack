@@ -3,6 +3,7 @@ import gymnasium as gym
 import argparse
 import time
 import itertools
+import glob
 import subprocess
 import shutil
 import os
@@ -20,7 +21,7 @@ gym.register(
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", type=str, default="step", choices=["step", "speedup", "vectorenv-speedup", "learn"])
+    parser.add_argument("--mode", type=str, default="step", choices=["step", "speedup", "vectorenv-speedup", "learn", "eval"])
     parser.add_argument("--repetitions", type=int, default=1),
     parser.add_argument("--autopilot", type=str, default="ardupilot", choices=["px4", "ardupilot"])  # RL actuation only exists for ardupilot; px4 trains on random motion
     parser.add_argument("--camera", action=argparse.BooleanOptionalAction, default=True, help="Enable/Disable Camera")
@@ -36,6 +37,10 @@ def main():
     parser.add_argument("--seed", type=int, default=None, help="Random seed applied to every env (episode goals and PPO)")
     parser.add_argument("--model-name", type=str, default=None, help="Base name for the saved PPO model (default: aas_ppo_<timestamp>)")
     parser.add_argument("--check-env", action=argparse.BooleanOptionalAction, default=False, help="Run the stable-baselines3 env checker before training")
+    # Options specific to --mode eval
+    parser.add_argument("--policy", type=str, default=None, help="Path to a saved PPO model .zip (default: most recent model under rl_logs/)")
+    parser.add_argument("--episodes", type=int, default=2, help="Number of episodes to run in eval mode")
+    parser.add_argument("--instance", type=int, default=0, help="AASEnv instance ID for eval mode (its own Docker subnet/containers)")
     args = parser.parse_args()
 
     if args.mode == "step":
@@ -243,6 +248,96 @@ def main():
         model.save(model_path)
         print(f"Model saved to {model_path}")
         venv.close()
+
+    elif args.mode == "eval":
+        from stable_baselines3 import PPO
+
+        # Resolve the policy: explicit path, or the most recently saved model under rl_logs/
+        if args.policy is not None:
+            policy_path = args.policy
+        else:
+            candidates = [p for p in glob.glob(os.path.join("rl_logs", "*", "*.zip")) if os.path.getsize(p) > 0]
+            if not candidates:
+                raise SystemExit(f"No saved PPO model found under '{os.path.join('rl_logs', '*', '*.zip')}'. Train one with --mode learn, or pass --policy <path/to/model.zip>.")
+            policy_path = max(candidates, key=os.path.getmtime)
+        print(f"Loading policy '{policy_path}' (deterministic actions)")
+        model = PPO.load(policy_path)
+
+        if args.autopilot != "ardupilot":
+            print("WARNING: RL actuation (velocity setpoints through MAVROS GUIDED mode) is only implemented for --autopilot ardupilot.")
+
+        # render_mode="human" -> HEADLESS=false in the containers -> 'gz sim' opens its 3D GUI on the host
+        # via X11 (needs DISPLAY set, e.g. run from a WSLg terminal)
+        if not os.environ.get("DISPLAY"):
+            print("WARNING: no DISPLAY set on this host - the Gazebo GUI window cannot open here.")
+            print("Run from a terminal with a display (WSLg/X11), or watch the sim headless via 'docker logs simulation-container-inst0'.")
+
+        env = gym.make(
+            "AASEnv-v0",
+            instance=args.instance,
+            gym_freq_hz=50,  # Must match training: pacing and rewards are tied to this frequency
+            autopilot=args.autopilot,
+            camera=args.camera,
+            lidar=args.lidar,
+            num_quads=args.num_quads,
+            render_mode="human",
+            gpu=args.gpu,
+            container_engine=args.engine,
+            gpu_vendor=args.gpu_vendor
+        )
+
+        STEP_DT = 1.0 / 50.0
+        STATUS_EVERY_SEC = 5.0
+        results = []
+        try:
+            for ep in range(1, args.episodes + 1):
+                print(f"\n== Episode {ep}/{args.episodes}: starting fresh simulation containers (the Gazebo window reopens after each restart)...")
+                obs, info = env.reset()
+                pos, goal = info["position"], info["goal"]
+                start_dist = float(np.linalg.norm(goal - pos))
+                print(f"Spawn:  x={pos[0]:7.2f}  y={pos[1]:7.2f}  z={pos[2]:6.2f} m")
+                print(f"Goal:   x={goal[0]:7.2f}  y={goal[1]:7.2f}  z={goal[2]:6.2f} m   (start distance {start_dist:.1f} m; success needs <=3.0 m horizontal + <=4.0 m vertical)")
+                print("Policy is in control - watch the Gazebo window. Sim time advances at 1x real-time pace.")
+
+                ep_start_wall = time.time()
+                next_status_wall = ep_start_wall + STATUS_EVERY_SEC
+                ret, steps = 0.0, 0
+                terminated = truncated = False
+                while not (terminated or truncated):
+                    action, _ = model.predict(obs, deterministic=True)
+                    step_start = time.perf_counter()
+                    obs, reward, terminated, truncated, info = env.step(action)
+                    # Pace the loop to wall clock so a human can watch at 1x speed
+                    elapsed = time.perf_counter() - step_start
+                    if elapsed < STEP_DT:
+                        time.sleep(STEP_DT - elapsed)
+                    ret += reward
+                    steps += 1
+                    if time.time() >= next_status_wall:
+                        p, g = info["position"], info["goal"]
+                        d_3d = float(np.linalg.norm(g - p))
+                        print(f"  [t={time.time()-ep_start_wall:5.0f}s] pos=({p[0]:7.2f}, {p[1]:7.2f}, {p[2]:6.2f})  "
+                              f"dist_to_goal={d_3d:6.1f} m (horiz {info['horizontal_distance_to_goal']:6.1f}, vert {info['vertical_error_to_goal']:+5.1f})  "
+                              f"return_so_far={ret:8.1f}")
+                        next_status_wall = time.time() + STATUS_EVERY_SEC
+
+                end_pos, end_goal = info["position"], info["goal"]
+                event = env.unwrapped.last_event or ("timeout" if truncated else "unknown")
+                horiz = float(np.linalg.norm(end_goal[:2] - end_pos[:2]))
+                print(f"Episode {ep} ended: {event.upper()} after {steps} steps ({time.time()-ep_start_wall:.1f} s wall clock)")
+                print(f"  Return:             {ret:9.2f}")
+                print(f"  Final position:     x={end_pos[0]:7.2f}  y={end_pos[1]:7.2f}  z={end_pos[2]:6.2f} m")
+                print(f"  Goal was at:        x={end_goal[0]:7.2f}  y={end_goal[1]:7.2f}  z={end_goal[2]:6.2f} m   (final horizontal distance {horiz:.1f} m)")
+                results.append((event, ret))
+        finally:
+            env.close()
+
+        if results:
+            n_success = sum(1 for event, _ in results if event == "success")
+            mean_ret = float(np.mean([r for _, r in results]))
+            print(f"\n=== Eval summary: {n_success}/{len(results)} episodes succeeded, mean return {mean_ret:.2f} ===")
+            for i, (event, ret) in enumerate(results, start=1):
+                print(f"  Episode {i}: {event:14s} return={ret:9.2f}")
 
     else:
         print(f"Unknown mode: {args.mode}")
