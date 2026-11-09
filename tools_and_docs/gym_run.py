@@ -31,6 +31,7 @@ def main():
     parser.add_argument("--gpu-vendor", type=str, default="auto", choices=["auto", "nvidia", "amd", "none"], help="GPU passthrough strategy; auto detects NVIDIA (/dev/nvidia*) vs AMD ROCm (/dev/kfd), else none (e.g. AMD under WSL); AMD is bound via /dev/kfd + /dev/dri on both engines")
     # Options specific to --mode learn
     parser.add_argument("--timesteps", type=int, default=200_000, help="Total RL training steps (environment interactions)")
+    parser.add_argument("--n-steps", type=int, default=None, help="PPO rollout length in env steps (default: min(2048, --timesteps), so small smoke tests stop at --timesteps instead of running a full 2048-step rollout)")
     parser.add_argument("--num-envs", type=int, default=1, help="Parallel AASEnv instances for RL training (instance IDs 0..num_envs-1)")
     parser.add_argument("--seed", type=int, default=None, help="Random seed applied to every env (episode goals and PPO)")
     parser.add_argument("--model-name", type=str, default=None, help="Base name for the saved PPO model (default: aas_ppo_<timestamp>)")
@@ -220,17 +221,22 @@ def main():
         except ImportError:
             print("Note: TensorBoard is not installed ('pip install stable-baselines3[tensorboard]'), training metrics will only be printed to stdout.")
 
+        # On-policy PPO trains in whole n_steps rollouts; without capping it, a --timesteps 200 smoke test would
+        # still run one full 2048-step rollout before stopping (the progress bar overshoots total_timesteps)
+        n_steps = args.n_steps if args.n_steps is not None else min(2048, max(args.timesteps, 1))
+
         model = PPO(
             "MlpPolicy",
             venv,
             verbose=1,
             device="auto",
             seed=args.seed,
+            n_steps=n_steps,
             policy_kwargs=dict(net_arch=[256, 256]),
             **tb_kwargs,
         )
 
-        print(f"Training PPO for {args.timesteps} steps on the goal-reaching task (each episode starts with an ~80s unpaused init)...")
+        print(f"Training PPO for {args.timesteps} steps ({n_steps}-step rollouts) on the goal-reaching task (each episode starts with an ~80s unpaused init)...")
         model.learn(total_timesteps=args.timesteps, progress_bar=True)
 
         model_path = os.path.join(log_dir, f"{model_name}.zip")
